@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://knewrall.com/schemas/concrete-node.schema.json",
+  "title": "Concrete Node Schema (Who, What, Where, When)",
+  "description": "Schema for concrete entity nodes with canonical names",
+  "allOf": [
+    {
+      "$ref": "master.schema.json"
+    },
+    {
+      "properties": {
+        "header": {
+          "properties": {
+            "type": {
+              "enum": ["Who", "What", "Where", "When"]
+            }
+          }
+        }
+      },
+      "required": ["header"]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+jsonschema>=4.0.0
+pytest>=7.0.0
+# Code graph
+tree-sitter>=0.23.0
+tree-sitter-language-pack>=0.7.0
+# Vector / embeddings (Part B)
+sqlite-vec>=0.1.7

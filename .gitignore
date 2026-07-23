@@ -1,0 +1,51 @@
+# Knewrall ephemeral databases (rebuildable caches — never sync).
+# NOTE: only the DBs are ignored, NOT the whole .knewrall/ dir, so that
+# .knewrall/config.json (synced configuration) stays under version control.
+/.knewrall/index.db
+/.knewrall/index.db-journal
+/.knewrall/index.db-wal
+/.knewrall/codegraph.db
+/.knewrall/codegraph.db-journal
+/.knewrall/codegraph.db-wal
+/.knewrall/vectors.db
+/.knewrall/vectors.db-journal
+/.knewrall/vectors.db-wal
+
+# External project clones live here and are NOT part of the KB. Keep the
+# folder + its README, ignore everything else (each project manages its own VCS).
+/projects/*
+!/projects/README.md
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Provider API keys (OPENROUTER_API_KEY_EMBEDS, etc.) — loaded by
+# knewrall_env.py, must never be committed. The `env/` rule above only
+# matches directories, not this file.
+.env
+
+# IDE — keep the shared pilot settings, ignore personal/local files
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

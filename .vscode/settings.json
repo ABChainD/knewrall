@@ -1,0 +1,16 @@
+{
+  "files.exclude": {
+    "**/.knewrall/index.db": true,
+    "**/.pytest_cache": true,
+    "**/__pycache__": true
+  },
+  "search.exclude": {
+    "**/.knewrall/index.db": true,
+    "**/.pytest_cache": true,
+    "**/__pycache__": true
+  },
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.nosetestsEnabled": false,
+  "python.analysis.extraPaths": ["src"]
+}

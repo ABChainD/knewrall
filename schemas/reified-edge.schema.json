@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://knewrall.com/schemas/reified-edge.schema.json",
+  "title": "Reified Edge Schema (Why, How)",
+  "description": "Schema for reified edges representing relationships or processes",
+  "allOf": [
+    {
+      "$ref": "master.schema.json"
+    },
+    {
+      "properties": {
+        "header": {
+          "properties": {
+            "type": {
+              "enum": ["Why", "How"]
+            },
+            "canonical_name": {
+              "type": "string",
+              "description": "Optional descriptive title (not strictly canonical)"
+            }
+          },
+          "required": ["source_node_id", "target_node_id"]
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["target_id", "predicate", "direction", "certainty"],
+            "properties": {
+              "target_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              },
+              "predicate": {
+                "type": "string",
+                "enum": ["caused_by", "part_of", "precedes", "enables", "explains", "implements"]
+              },
+              "direction": {
+                "type": "string",
+                "enum": ["outbound", "inbound", "bidirectional"]
+              },
+              "certainty": {
+                "type": "string",
+                "enum": ["confirmed", "rumored", "hypothetical", "alternative"]
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "required": ["header"]
+    }
+  ]
+}

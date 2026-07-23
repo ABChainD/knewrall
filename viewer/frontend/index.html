@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Knewrall Viewer</title>
+    <link rel="stylesheet" href="/src/styles/app.css" />
+  </head>
+  <body>
+    <div id="graph"></div>
+
+    <div class="kw-chrome">
+      <div class="kw-search-bar" id="search-bar">
+        <input class="kw-search-input" type="text" placeholder="Search the graph…" autocomplete="off" />
+        <label class="kw-search-hybrid-label">
+          <input class="kw-search-hybrid" type="checkbox" checked />
+          semantic
+        </label>
+        <label class="kw-search-hybrid-label" title="Restrict the 3D graph to matching nodes and their direct connections">
+          <input class="kw-search-filter" type="checkbox" />
+          filter graph
+        </label>
+        <ul class="kw-search-results" id="search-results" role="listbox"></ul>
+      </div>
+
+      <aside class="kw-panel" id="detail-panel">
+        <button class="kw-panel-close" aria-label="Close">×</button>
+        <div class="kw-panel-body"></div>
+      </aside>
+
+      <div class="kw-status-bar" id="status-bar">
+        <span class="kw-status-stats">loading…</span>
+        <span class="kw-status-message"></span>
+        <button class="kw-status-refresh" title="Refresh graph data">⟳</button>
+      </div>
+
+      <div class="kw-toggles" id="toggles">
+        <button class="kw-toggle" data-toggle="cluster" title="Toggle pillar clustering">Cluster</button>
+        <button class="kw-toggle" data-toggle="topdown" title="Top-down view">Top-down</button>
+        <button class="kw-toggle" data-toggle="rotate" title="Toggle idle auto-rotate">Rotate</button>
+        <button class="kw-toggle" data-toggle="privacy" title="Toggle Privacy Mode">Privacy</button>
+      </div>
+
+      <div class="kw-legend" id="legend"></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

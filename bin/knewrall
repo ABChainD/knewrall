@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Knewrall launcher (POSIX). Forwards all args to the path-independent Python
+# entry point next to this file.
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$DIR/knewrall.py" "$@"

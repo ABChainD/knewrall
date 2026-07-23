@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "description": "Knewrall knowledge base manifest. Documents the canonical folder layout, ownership, and sub-foldering (sharding) rules. Agents should read this to understand where things live and which folders they may write to.",
+  "folders": {
+    "neurons": {
+      "purpose": "Structured knowledge nodes (.json source of truth + .md companions).",
+      "owner": "knewrall",
+      "indexed": true,
+      "sharding": { "scheme": "uuid_prefix", "depth": 1, "width": 2 }
+    },
+    "notes": {
+      "purpose": "Distilled, link-enriched markdown notes produced by the system.",
+      "owner": "knewrall",
+      "indexed": true,
+      "sharding": { "scheme": "date", "pattern": "YYYY/MM" }
+    },
+    "media": {
+      "purpose": "Multimedia attachments (images, audio, video, PDFs).",
+      "owner": "knewrall",
+      "indexed": "tracked_not_parsed",
+      "sharding": { "scheme": "date", "pattern": "YYYY/MM" }
+    },
+    "archive": {
+      "purpose": "Static, non-multimedia files kept as immutable records.",
+      "owner": "knewrall",
+      "indexed": "tracked_not_parsed",
+      "mutable_contents": false,
+      "sharding": { "scheme": "date", "pattern": "YYYY/MM" }
+    },
+    "workdesk": {
+      "purpose": "Intake/scratch area for raw user-provided input awaiting processing.",
+      "owner": "shared",
+      "indexed": "scanned_for_intake",
+      "transient": true,
+      "sharding": { "scheme": "none" }
+    },
+    "projects": {
+      "purpose": "External sub-projects / repo clones. Read-only source of knowledge for the KB.",
+      "owner": "user",
+      "indexed": false,
+      "knewrall_write_forbidden": true,
+      "sharding": { "scheme": "none" }
+    }
+  },
+  "index": {
+    "db_path": ".knewrall/index.db",
+    "ephemeral": true,
+    "rebuildable": true
+  },
+  "code_index": {
+    "db_path": ".knewrall/codegraph.db",
+    "ephemeral": true,
+    "rebuildable": true,
+    "roots": ["projects"],
+    "languages": ["python", "javascript", "typescript"],
+    "incremental": true
+  },
+  "embeddings": {
+    "db_path": ".knewrall/vectors.db",
+    "ephemeral": true,
+    "rebuildable": true,
+    "provider": "openrouter",
+    "embed_neurons": true,
+    "embed_notes": true,
+    "embed_code_symbols": true
+  }
+}
