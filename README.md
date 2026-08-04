@@ -22,11 +22,15 @@ inspectable, versionable, and conflict-free under Git/Dropbox sync.
 
 On top of that graph, Knewrall also **understands your codebases** (a full symbol
 graph of functions, classes, and call relationships), finds things **by meaning, not
-just by keyword** (hybrid literal + semantic vector search), gives you a
-**live 3D map** to fly through everything it knows, and keeps agents from drowning
-in their own scrollback with **short-term memory** — verbose command output gets
-folded into a compact digest instead of flooding the context window, retrievable
-on demand and promotable to a durable Neuron if it turns out to matter.
+just by keyword** (hybrid literal + semantic vector search), and gives you a
+**live 3D map** to fly through everything it knows.
+
+Agents also get **short-term memory**: the Engram Layer's whole purpose is to
+**compact** verbose, transient context — test runs, build logs, long diffs — so it
+stops flooding the context window, without ever actually losing anything. Folding is
+**lossless and reversible**: the full detail always stays on disk, `unfold` brings
+back exactly the part you need on demand, and anything that turns out to matter can
+be promoted straight into a durable Neuron.
 
 ## The problem it solves
 
