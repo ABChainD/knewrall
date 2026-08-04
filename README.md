@@ -22,8 +22,11 @@ inspectable, versionable, and conflict-free under Git/Dropbox sync.
 
 On top of that graph, Knewrall also **understands your codebases** (a full symbol
 graph of functions, classes, and call relationships), finds things **by meaning, not
-just by keyword** (hybrid literal + semantic vector search), and gives you a
-**live 3D map** to fly through everything it knows.
+just by keyword** (hybrid literal + semantic vector search), gives you a
+**live 3D map** to fly through everything it knows, and keeps agents from drowning
+in their own scrollback with **short-term memory** — verbose command output gets
+folded into a compact digest instead of flooding the context window, retrievable
+on demand and promotable to a durable Neuron if it turns out to matter.
 
 ## The problem it solves
 
