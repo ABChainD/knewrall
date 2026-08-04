@@ -8,6 +8,15 @@ Exposes these tools to MCP clients (e.g. OpenCode):
   - knewrall_recall        : consolidated retrieval — full neuron bodies +
                               related-link summaries in one call, TOON-encoded
   - knewrall_stats         : node / edge / alias counts
+  - knewrall_unfold        : read back folded short-term-memory content (an
+                              engram) by key — read-only (marking unfolds/
+                              extending ttl_at in session.json is a state
+                              mutation of the *ephemeral* store, not the
+                              knowledge base itself, so this stays within the
+                              server's stated read-only contract). This is the
+                              only automation harnesses without Claude-Code-
+                              style hooks (e.g. OpenCode) get for the Engram
+                              Layer — see short-term-memory-layer-plan.md §2.1.
 
 Writes nothing to the knowledge base; all mutating verbs stay on the CLI.
 
@@ -39,7 +48,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from mcp.server.fastmcp import FastMCP
 
-from src.knewrall_middleware import search_graph as _search_graph, recall as _recall
+from src.knewrall_middleware import search_graph as _search_graph, recall as _recall, unfold as _unfold
 from src.knewrall_indexer import KnewrallIndexer
 from src.knewrall_toon import encode as _encode_toon
 
@@ -110,6 +119,49 @@ def knewrall_recall(terms: list[str], depth: int = 1) -> str:
     """
     result = _recall(terms, depth=depth)
     return _encode_toon(result)
+
+
+@mcp.tool()
+def knewrall_unfold(
+    key: str,
+    grep: str | None = None,
+    context: int = 0,
+    lines: str | None = None,
+    head: int | None = None,
+    tail: int | None = None,
+) -> str:
+    """Read back folded short-term-memory content (an "engram") by its
+    retrieval key — the Engram Layer's context-folding subsystem.
+
+    Prefer `grep`/`lines` over a bare call: an unwindowed unfold is capped at
+    `unfold_max_chars` (enforced here, server-side, since MCP responses are
+    injected whole — same cap the CLI's `unfold` applies by default).
+
+    Args:
+        key: The engram key from a fold marker (e.g. "9c2b41d7f0").
+        grep: Return only matching lines, with `context` lines around each.
+        context: Lines of context around each grep match (default 0).
+        lines: "A-B" — a byte-cheap line-range slice (1-indexed, inclusive).
+        head: Return only the first N lines.
+        tail: Return only the last N lines.
+
+    Returns:
+        JSON: {"content": str, "truncated": bool, "meta": {...}} on success,
+        or {"error": str} if the key doesn't resolve (expired, discarded, or
+        never existed on this machine — engrams are per-machine and never
+        synced across a `teamwork remote dispatch`).
+    """
+    lines_tuple = None
+    if lines:
+        try:
+            a, b = lines.split("-", 1)
+            lines_tuple = (int(a), int(b))
+        except ValueError:
+            return _json({"error": f"lines must be 'A-B' (got {lines!r})"})
+    result = _unfold(key, grep=grep, grep_context=context, lines=lines_tuple, head=head, tail=tail)
+    if not result["found"]:
+        return _json({"error": result["error"]})
+    return _json({"content": result["content"], "truncated": result["truncated"], "meta": result["meta"]})
 
 
 @mcp.tool()

@@ -16,6 +16,19 @@
 /projects/*
 !/projects/README.md
 
+# Ephemeral short-term memory (Engram Layer) — per-machine, never synced, TTL'd.
+# Keep the folder + its README, ignore everything else, matching the /projects/
+# pattern above (engrams/ is invisible to refresh-index/rebuild-index by
+# construction — see knewrall_indexer.py's refresh_index(), which only globs
+# neurons_dir/notes_dir).
+/engrams/*
+!/engrams/README.md
+
+# Engram Layer session identity + adaptive-digest stats — per-machine only.
+/.knewrall/sessions/
+/.knewrall/session_current
+/.knewrall/engram_stats.json
+
 # Python cache
 __pycache__/
 *.py[cod]

@@ -18,7 +18,7 @@ deterministic formatting so the graph stays conflict-free under Git/Dropbox sync
 
 ## 1. Always-on behavior (no user request needed)
 
-These two habits run automatically for every task, in the background, without
+These three habits run automatically for every task, in the background, without
 announcing them unless they affect your answer:
 
 1. **Ground before you act.** At the start of a task — and whenever you hit a name,
@@ -41,6 +41,19 @@ announcing them unless they affect your answer:
    preferences, how things are done — capture it as a Neuron (and link it to related
    Neurons). Do this proactively. Skip throwaway/conversational details and anything
    already in the graph (check first with `search-graph`).
+
+3. **Fold before you flood.** Before running a command or reading a file you expect
+   to produce more than ~150 lines — test runs, builds, `git log`, `docker logs`,
+   whole-file reads of large sources, bulk `grep` — run it through `fold-run` instead:
+
+   ```
+   python knewrall/bin/knewrall.py fold-run --label "<why you ran it>" -- pytest -q tests/
+   ```
+
+   You get the head, the tail, and a digest inline, plus a retrieval key. If you
+   later need a part you didn't get, `unfold <key> --grep "<pattern>"`. Never fold
+   Knewrall's own `recall` output — it is already budgeted. See §2's short-term
+   memory table for the full command surface (`fold`, `unfold`, `folds`, ...).
 
 If a fact is ambiguous or sensitive, ask once before saving. Otherwise just save it.
 
@@ -113,6 +126,31 @@ Embeddings are cached by content hash — re-run `embed` only when content chang
 `vectors.db` is synced across machines on purpose (embeddings are paid API calls); if
 Syncthing ever reports a conflict on it, run `embed --reconcile` on the conflict file.
 
+### Short-term memory / context folding
+
+The **Engram Layer** — fold verbose output out of your live context, retrieve it
+by key only if you actually need it. Knewrall is a subprocess, not a proxy: it
+cannot delete tokens already in your context window, but it can stop content
+from entering it in the first place, which is strictly better anyway.
+
+| Command | Purpose |
+|---|---|
+| `fold-run [--label "<why>"] [--kind <k>] [--keep-head N] [--keep-tail N] [--quiet] -- <command…>` | **The primary context saver.** Runs `<command>`, stores its full combined stdout+stderr as an engram, prints head + tail + a type-aware digest + a retrieval marker. The raw output never enters your context. Exit code is passed through unchanged. |
+| `fold [--label "<why>"] [--kind <k>] [--file <path>] [--quiet]` | Fold content you already have (stdin) or a file you're about to read. Returns a marker with the retrieval key. No-ops (passthrough, no engram written) below the size floor (~2KB/40 lines) — folding something small is a net loss. Refuses (passthrough + warning) on instruction files (`INSTRUCTIONS.md`, `CLAUDE.md`, `AGENTS.md`, schemas, ...) and on Knewrall's own output. |
+| `unfold <key> [--grep <pat> [--context N]] [--lines A-B] [--head N] [--tail N] [--max-chars N] [--meta]` | Read folded content back. **Prefer `--grep`/`--lines`** — a bare `unfold` is capped at 40,000 chars. Also exposed read-only over MCP as `knewrall_unfold` for harnesses like OpenCode that have a tool-injection position but no Claude-Code-style hooks. An unresolved key means the engram expired/was discarded, or never existed on this machine — engrams are per-machine and never synced; `consolidate` first if content needs to cross machines. |
+| `folds [--session <id>] [--kind <k>] [--grep <t>] [--limit 20] [--all]` | List this session's engrams (metadata only, TOON) with a token-savings total. |
+| `fold-scan "<terms>"…` | Budgeted relevance check: which folded content might matter to these terms. Emits ≤ 4 markers, ≤ 2,000 chars. Runs automatically once per turn via a `UserPromptSubmit` hook; callable by hand too. |
+| `consolidate <key> (--json '<payload>'\|<file>\|- \| --suggest \| --archive-only) [--archive] [--link <id> <predicate>]` | Promote an engram into the durable graph — wraps `propose-node`/`propose-link` (no parallel node-creation path). `--archive` also copies the raw blob into `archive/`. `--suggest` drafts a payload without writing. `--json` accepts inline, a file path, or stdin, matching `propose-node`. **Never put a bare engram key in a `remote add --task` string** — `consolidate` first if content needs to cross machines. |
+| `fold-gc [--session <id>] [--all] [--older-than <dur>] [--keep-consolidated] [--purge-consolidated] [--dry-run]` | Discard engrams. TTL sweeps also run opportunistically on every `fold`/`unfold`/`folds`. Consolidated/archived engrams are preserved indefinitely unless `--purge-consolidated`. |
+| `fold-stats` | Per-kind fold/unfold counts, unfold rate, adaptive digest settings, disk usage. |
+
+Engrams live in `knewrall/engrams/`, are never indexed (invisible to
+`refresh-index`/`rebuild-index` by construction), never synced across machines, and
+TTL out automatically (default 72h). Nothing here is durable — promote anything
+worth keeping into a Neuron. **Never put a bare engram key in a `remote add --task`
+string** (teamwork's remote-dispatch verb) — the receiving machine can't resolve it;
+`consolidate` the content into a Neuron first if it needs to cross machines.
+
 ---
 
 ## 3. Workspace layout
@@ -124,6 +162,10 @@ Read `knewrall/.knewrall/config.json` for the authoritative folder map. Key rule
 - **`knewrall/neurons/ notes/ media/ archive/`** — owned by Knewrall; written **only**
   through the CLI. `neurons/` is sharded by UUID prefix; the others by date.
   `archive/` and `media/` contents are immutable — you may add files, never edit them.
+- **`knewrall/engrams/`** — ephemeral short-term memory (see §2's folding table).
+  Sharded by session start date, never indexed, never synced, TTL'd. Written only
+  through `fold`/`fold-run`; discardable at any time with no loss of durable
+  knowledge.
 - The **surrounding workspace** (everything outside `knewrall/`) is the user's own
   project. You may read it as a source of knowledge, but Knewrall automation must
   never modify it as a side effect.

@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://knewrall.com/schemas/engram.schema.json",
+  "title": "Knewrall Engram Header",
+  "description": "Line-1 JSON header of a .engram file (short-term memory / context folding). Written exactly once, at fold time, and never rewritten — the .engram file is write-once/immutable. All MUTABLE per-engram state (unfolds, last_unfold_at, ttl_at, consolidated_to, archived_path) lives in the owning session's session.json instead, never in this header. See short-term-memory-layer-plan.md §1.4 for why (bumping a stat in a variable-length JSON header line would force a full atomic rewrite of a file up to max_session_bytes on every single `unfold`).",
+  "type": "object",
+  "required": ["v", "key", "session", "created_at", "kind", "bytes", "lines", "est_tokens", "protected"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 1,
+      "description": "Header schema version"
+    },
+    "key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{10}([0-9a-f]{2})*$",
+      "description": "Content-addressed key: sha256(payload_bytes) truncated to 10 hex chars, extended by 2-hex-char increments on collision. This is the FINAL (possibly disambiguated) key — filename is <key>.engram."
+    },
+    "session": {
+      "type": "string",
+      "description": "session_id (full, not the 8-char short form) that folded this engram"
+    },
+    "created_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+      "description": "UTC ISO-8601 timestamp, second precision"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "test_log", "build_log", "run_log", "json_output", "search_results",
+        "diff", "source_code", "tabular", "config", "dir_listing", "prose"
+      ],
+      "description": "ContentRouter classification, drives the digest strategy (Phase 2)"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tool": { "type": ["string", "null"], "description": "e.g. Bash, Read" },
+        "cmd": { "type": ["string", "null"], "description": "The command that produced this content, if any" },
+        "path": { "type": ["string", "null"], "description": "Source file path, if this folded a file" },
+        "cwd": { "type": ["string", "null"] }
+      },
+      "description": "Provenance of the folded content"
+    },
+    "label": {
+      "type": "string",
+      "description": "Agent-supplied human-readable reason for the fold"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Payload byte count, UNCOMPRESSED (Kimi K3 I11 — est_tokens must be derived from this, not the on-disk compressed size, once Phase 4 gzip lands)"
+    },
+    "lines": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "est_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "ceil(bytes/4) — deliberately crude, never a tokenizer dependency"
+    },
+    "digest": {
+      "type": "string",
+      "description": "Type-aware compressed summary retained inline in the fold marker"
+    },
+    "keywords": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 24,
+      "description": "Locally/deterministically extracted identifier-shaped tokens, file path components, error class names — the only thing fold-scan searches, never the blob"
+    },
+    "encoding": {
+      "type": "string",
+      "enum": ["raw", "gzip"],
+      "description": "Payload encoding on disk. 'raw' (default) until Phase 4 gzip lands for blobs over compress_over_bytes."
+    },
+    "protected": {
+      "type": "boolean",
+      "description": "True if source.path resolved under neurons/, notes/, or archive/ at fold time (path-based durability check — NOT checksum-based, since system.checksum is unpopulated in this codebase). Write-once; never toggled after fold. Skipped by TTL GC."
+    }
+  }
+}

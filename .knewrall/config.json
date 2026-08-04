@@ -40,7 +40,38 @@
       "indexed": false,
       "knewrall_write_forbidden": true,
       "sharding": { "scheme": "none" }
+    },
+    "engrams": {
+      "purpose": "Ephemeral short-term memory: content folded out of an agent's live conversation context, retrievable by key within a session. Discardable at any time.",
+      "owner": "knewrall",
+      "indexed": false,
+      "transient": true,
+      "ttl_hours": 72,
+      "sharding": { "scheme": "session_date", "pattern": "YYYY/MM-DD/<session_short>" }
     }
+  },
+  "engrams": {
+    "ttl_hours": 72,
+    "session_idle_hours": 8,
+    "max_session_bytes": 268435456,
+    "min_fold_bytes": 2048,
+    "min_fold_lines": 40,
+    "keep_head_lines": 20,
+    "keep_tail_lines": 20,
+    "unfold_max_chars": 40000,
+    "promote_hint_threshold": 2,
+    "never_fold_globs": [
+      "knewrall/schemas/**",
+      "**/INSTRUCTIONS.md",
+      "**/CLAUDE.md",
+      "**/AGENTS.md",
+      "**/GEMINI.md",
+      "**/.clinerules",
+      "**/SKILL.md",
+      ".claude/settings*.json"
+    ],
+    "enforce": false,
+    "enforce_patterns": ["pytest", "npm test", "cargo build", "docker logs", "tsc"]
   },
   "index": {
     "db_path": ".knewrall/index.db",

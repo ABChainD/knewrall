@@ -62,6 +62,7 @@ durable facts — no special prompt required each time.
 | 💻 **Code graphing** | Index any repo into a real symbol graph — definitions, callers, callees, imports — and link neurons straight to the code that implements them. |
 | 🔎 **Semantic + literal search** | Hybrid retrieval blends exact-match search with vector KNN over embeddings, merged via Reciprocal Rank Fusion, so a query matches on *meaning* as well as substring. |
 | 🪐 **3D Graph Viewer** | A local, self-contained explorer — fly through your graph, hover, expand, follow links, search — all in the browser, all offline. |
+| 🧵 **Short-term memory** | `fold-run` captures verbose command output (test runs, builds, logs) to disk and hands your agent a short digest instead of the raw dump — retrievable on demand, auto-expiring, promotable to a durable Neuron if it turns out to matter. |
 | 🔌 **Any agent harness** | One installer wires Claude Code, Codex, Gemini CLI, Cline, and anything else that reads a root instruction file. |
 | 🔒 **Local-first & private** | Plain files on your disk. No account, no cloud dependency, no lock-in. Semantic search calls out only when *you* enable it. |
 
@@ -193,6 +194,30 @@ latency/quality/cost tradeoff — [`docs/VECTOR_SEARCH.md`](docs/VECTOR_SEARCH.m
 has comparative latency numbers across ten OpenRouter embedding models if
 you want data points, but the release ships with no opinion baked in.
 
+## Short-term memory (context folding)
+
+Neurons are for durable facts. But agents also generate a lot of *transient* noise —
+a full test-suite run, a long build log, a giant `git diff`, a file read that's 90%
+boilerplate — and reading all of it back into context on every turn is how a session
+runs out of room. The **Engram Layer** handles that other half of the memory problem:
+
+```bash
+python knewrall/bin/knewrall.py fold-run --label "pytest run" -- pytest -q tests/
+```
+
+Knewrall runs the command, keeps the full output on disk, and hands the agent back a
+short digest — pass/fail counts, the failing lines, a retrieval key — instead of
+12,000 raw lines of scrollback. Need more later? `unfold <key> --grep "AssertionError"`
+pulls back exactly the part that matters, windowed and cheap. Nothing is ever thrown
+away: the full output sits in `knewrall/engrams/`, expires automatically after a few
+days, and can be promoted straight into a durable Neuron with `consolidate <key>` if
+it turns out to be worth keeping.
+
+It's per-machine and ephemeral by design — never synced, never indexed, gone by
+default — layered on top of the same CLI you already use: `fold`, `fold-run`,
+`unfold`, `folds`, `fold-scan`, `consolidate`, `fold-gc`. Full command reference in
+[`INSTRUCTIONS.md`](INSTRUCTIONS.md#2-the-cli-your-only-tools).
+
 ## Directory Structure
 
 | Folder | Owner | Purpose |
@@ -201,6 +226,7 @@ you want data points, but the release ships with no opinion baked in.
 | [`notes/`](notes/README.md) | Knewrall | Distilled markdown notes, sharded by date `YYYY/MM` |
 | [`media/`](media/README.md) | Knewrall | Multimedia attachments, sharded by date `YYYY/MM` |
 | [`archive/`](archive/README.md) | Knewrall | Static, immutable file records, sharded by date `YYYY/MM` |
+| [`engrams/`](engrams/README.md) | Knewrall | Ephemeral short-term memory (Engram Layer) — folded command output, per-machine, auto-expiring |
 | [`workdesk/`](workdesk/README.md) | You + agents | Intake/scratch for raw input awaiting processing |
 | [`projects/`](projects/README.md) | You | External repo clones — read-only source of knowledge; never written by KB scripts |
 | [`viewer/`](viewer/README.md) | Knewrall | The 3D Graph Viewer (FastAPI backend + three.js frontend) |

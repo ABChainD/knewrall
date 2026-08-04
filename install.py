@@ -35,6 +35,9 @@ KNEWRALL_DIR = Path(__file__).resolve().parent
 BEGIN = "<!-- KNEWRALL:BEGIN (managed by knewrall/install.py — edits here are overwritten) -->"
 END = "<!-- KNEWRALL:END -->"
 HOOK_COMMAND = "python .claude/hooks/knewrall_session_start.py"
+FOLD_TURN_HOOK_COMMAND = "python .claude/hooks/knewrall_fold_turn.py"
+PRECOMPACT_HOOK_COMMAND = "python .claude/hooks/knewrall_precompact.py"
+FOLD_ENFORCE_HOOK_COMMAND = "python .claude/hooks/knewrall_fold_enforce.py"
 
 
 def _block_body(instructions_rel: str, launcher_rel: str, *, claude_import: bool) -> str:
@@ -104,8 +107,12 @@ def remove_block(path: Path) -> str:
     return "file removed"
 
 
-def install_claude_hardening(workspace: Path) -> list[str]:
-    """Copy the SessionStart hook + skill and register the hook in settings.json."""
+def install_claude_hardening(workspace: Path, *, with_fold_enforcement: bool = False) -> list[str]:
+    """Copy the SessionStart + UserPromptSubmit + PreCompact hooks and skill,
+    and register all three hooks in settings.json. The PreToolUse fold
+    enforcer (Phase 5) is opt-in — only installed/registered/enabled with
+    `--with-fold-enforcement`, since it's the only Engram Layer piece that
+    can actively obstruct the agent (a `deny` decision on a Bash call)."""
     notes = []
     src = KNEWRALL_DIR / "templates" / "claude"
     dst = workspace / ".claude"
@@ -114,6 +121,19 @@ def install_claude_hardening(workspace: Path) -> list[str]:
     hook_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src / "hooks" / "knewrall_session_start.py", hook_dst)
     notes.append(".claude/hooks/knewrall_session_start.py")
+
+    fold_turn_dst = dst / "hooks" / "knewrall_fold_turn.py"
+    shutil.copy2(src / "hooks" / "knewrall_fold_turn.py", fold_turn_dst)
+    notes.append(".claude/hooks/knewrall_fold_turn.py")
+
+    precompact_dst = dst / "hooks" / "knewrall_precompact.py"
+    shutil.copy2(src / "hooks" / "knewrall_precompact.py", precompact_dst)
+    notes.append(".claude/hooks/knewrall_precompact.py")
+
+    if with_fold_enforcement:
+        fold_enforce_dst = dst / "hooks" / "knewrall_fold_enforce.py"
+        shutil.copy2(src / "hooks" / "knewrall_fold_enforce.py", fold_enforce_dst)
+        notes.append(".claude/hooks/knewrall_fold_enforce.py")
 
     skill_dst = dst / "skills" / "knewrall"
     skill_dst.mkdir(parents=True, exist_ok=True)
@@ -126,23 +146,87 @@ def install_claude_hardening(workspace: Path) -> list[str]:
         try:
             data = json.loads(settings.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            print(f"  ! {settings} is not valid JSON — leaving it untouched; register the hook manually.")
+            print(f"  ! {settings} is not valid JSON — leaving it untouched; register the hooks manually.")
             return notes
-    hooks = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+
+    session_start_hooks = data.setdefault("hooks", {}).setdefault("SessionStart", [])
     already = any(
         h.get("command") == HOOK_COMMAND
-        for group in hooks for h in group.get("hooks", [])
+        for group in session_start_hooks for h in group.get("hooks", [])
     )
+    changed = False
     if not already:
-        hooks.append({"hooks": [{"type": "command", "command": HOOK_COMMAND}]})
-        settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        session_start_hooks.append({"hooks": [{"type": "command", "command": HOOK_COMMAND}]})
         notes.append(".claude/settings.json (SessionStart hook registered)")
+        changed = True
+
+    # APPEND to the existing UserPromptSubmit group — never replace it. Other
+    # subsystems (e.g. teamwork's teamwork_route.py) may already own a hook
+    # there, and this one is meant to run AFTER it (fold-scan re-surfacing
+    # folded context is lower priority than routing the turn itself).
+    prompt_hooks = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
+    already_prompt = any(
+        h.get("command") == FOLD_TURN_HOOK_COMMAND
+        for group in prompt_hooks for h in group.get("hooks", [])
+    )
+    if not already_prompt:
+        prompt_hooks.append({"hooks": [{"type": "command", "command": FOLD_TURN_HOOK_COMMAND}]})
+        notes.append(".claude/settings.json (UserPromptSubmit fold-scan hook registered, appended after any existing hooks)")
+        changed = True
+
+    precompact_hooks = data.setdefault("hooks", {}).setdefault("PreCompact", [])
+    already_precompact = any(
+        h.get("command") == PRECOMPACT_HOOK_COMMAND
+        for group in precompact_hooks for h in group.get("hooks", [])
+    )
+    if not already_precompact:
+        precompact_hooks.append({"hooks": [{"type": "command", "command": PRECOMPACT_HOOK_COMMAND}]})
+        notes.append(".claude/settings.json (PreCompact transcript-ingestion hook registered)")
+        changed = True
+
+    if with_fold_enforcement:
+        pretooluse_hooks = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+        already_enforce = any(
+            h.get("command") == FOLD_ENFORCE_HOOK_COMMAND
+            for group in pretooluse_hooks for h in group.get("hooks", [])
+        )
+        if not already_enforce:
+            pretooluse_hooks.append({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": FOLD_ENFORCE_HOOK_COMMAND}],
+            })
+            notes.append(".claude/settings.json (PreToolUse fold enforcer registered, Bash only)")
+            changed = True
+
+        engrams_config_note = _enable_fold_enforcement_in_config()
+        if engrams_config_note:
+            notes.append(engrams_config_note)
+
+    if changed:
+        settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return notes
+
+
+def _enable_fold_enforcement_in_config() -> str | None:
+    """Flip `engrams.enforce` to true in knewrall/.knewrall/config.json —
+    installing the hook without this would be a silent no-op, since the hook
+    itself checks this flag and allows everything when it's false."""
+    config_path = KNEWRALL_DIR / ".knewrall" / "config.json"
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("engrams", {}).get("enforce") is True:
+        return None
+    data.setdefault("engrams", {})["enforce"] = True
+    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return ".knewrall/config.json (engrams.enforce set to true)"
 
 
 def uninstall_claude_hardening(workspace: Path) -> None:
     dst = workspace / ".claude"
-    for p in [dst / "hooks" / "knewrall_session_start.py"]:
+    for p in [dst / "hooks" / "knewrall_session_start.py", dst / "hooks" / "knewrall_fold_turn.py",
+              dst / "hooks" / "knewrall_precompact.py", dst / "hooks" / "knewrall_fold_enforce.py"]:
         if p.exists():
             p.unlink()
             print(f"  removed {p.relative_to(workspace)}")
@@ -154,16 +238,25 @@ def uninstall_claude_hardening(workspace: Path) -> None:
     if settings.exists():
         try:
             data = json.loads(settings.read_text(encoding="utf-8"))
-            groups = data.get("hooks", {}).get("SessionStart", [])
-            for g in groups:
-                g["hooks"] = [h for h in g.get("hooks", []) if h.get("command") != HOOK_COMMAND]
-            data["hooks"]["SessionStart"] = [g for g in groups if g.get("hooks")]
-            if not data["hooks"]["SessionStart"]:
-                data["hooks"].pop("SessionStart")
-            if not data["hooks"]:
-                data.pop("hooks")
+            for event, command in (
+                ("SessionStart", HOOK_COMMAND),
+                ("UserPromptSubmit", FOLD_TURN_HOOK_COMMAND),
+                ("PreCompact", PRECOMPACT_HOOK_COMMAND),
+                ("PreToolUse", FOLD_ENFORCE_HOOK_COMMAND),
+            ):
+                groups = data.get("hooks", {}).get(event, [])
+                for g in groups:
+                    g["hooks"] = [h for h in g.get("hooks", []) if h.get("command") != command]
+                remaining = [g for g in groups if g.get("hooks")]
+                if event in data.get("hooks", {}):
+                    if remaining:
+                        data["hooks"][event] = remaining
+                    else:
+                        data["hooks"].pop(event)
+            if not data.get("hooks"):
+                data.pop("hooks", None)
             settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-            print("  deregistered SessionStart hook from .claude/settings.json")
+            print("  deregistered SessionStart + UserPromptSubmit (fold-scan) + PreCompact + PreToolUse (fold enforcer) hooks from .claude/settings.json")
         except json.JSONDecodeError:
             pass
 
@@ -186,6 +279,11 @@ def main() -> None:
     parser.add_argument("--uninstall", action="store_true", help="Remove managed blocks and hardening.")
     parser.add_argument("--no-claude", action="store_true", help="Skip Claude Code hook/skill hardening.")
     parser.add_argument("--no-index", action="store_true", help="Skip building the search index.")
+    parser.add_argument("--with-fold-enforcement", action="store_true",
+                        help="Opt-in: install the PreToolUse Engram Layer enforcer (denies verbose bare "
+                             "Bash commands, e.g. pytest, telling the agent to re-run via fold-run) and "
+                             "set engrams.enforce=true. Off by default — the only Engram Layer piece "
+                             "that can actively obstruct the agent.")
     args = parser.parse_args()
 
     workspace = args.workspace.resolve()
@@ -213,7 +311,7 @@ def main() -> None:
 
     if not args.no_claude:
         print("Claude Code hardening:")
-        for note in install_claude_hardening(workspace):
+        for note in install_claude_hardening(workspace, with_fold_enforcement=args.with_fold_enforcement):
             print(f"  + {note}")
 
     if not args.no_index:

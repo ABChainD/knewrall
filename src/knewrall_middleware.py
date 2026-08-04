@@ -7,6 +7,7 @@ enforcing strict validation and deterministic formatting.
 AI agents must use this middleware exclusively—no direct file writes.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -26,6 +27,8 @@ from .knewrall_indexer import KnewrallIndexer, DEFAULT_NOTES_DIR
 from .paths import get_root
 from .knewrall_codegraph import KnewrallCodeGraph, DEFAULT_PROJECTS_DIR
 from .knewrall_env import load_dotenv_once
+from . import knewrall_engrams as _engrams
+from . import knewrall_fold_router as _fold_router
 
 # Make provider API keys (OPENROUTER_API_KEY, etc.) reachable regardless of the
 # invoking harness — the engine talks to the embedding provider on its own.
@@ -203,7 +206,7 @@ def _fuzzy_match(a: str, b: str) -> float:
 # embed call, this bounds recall()/search_graph(hybrid=True) latency to a few
 # seconds worst case instead of the tens-of-seconds-to-minutes a slow/
 # unresponsive embedding provider could previously cause (see
-# docs/PERF_FINDINGS.md for the investigation this replaced).
+# PERF_FINDINGS.md for the investigation this replaced).
 
 _QUERY_TERM_KIND = "query_term"
 
@@ -493,7 +496,7 @@ def recall(terms: Union[str, List[str]], depth: int = 1, limit: int = 20,
     # per term) and time-boxed, so a slow/unresponsive provider degrades to
     # literal-only in a few seconds rather than compounding N sequential
     # multi-second-to-many-second calls -- the root cause of the multi-minute
-    # recall() calls this replaced (see docs/PERF_FINDINGS.md).
+    # recall() calls this replaced (see PERF_FINDINGS.md).
     per_term_semantic: List[List[Dict]] = [[] for _ in terms]
     semantic_pending = False
     if hybrid:
@@ -1136,7 +1139,7 @@ def embed_query_terms() -> Tuple[int, int]:
     """
     Proactively embeds every canonical_name + alias + tag string already in
     the graph as a query_term cache entry (see _query_cache_get/_put above
-    and docs/VECTOR_SEARCH.md). recall()/search-graph terms are overwhelmingly
+    and VECTOR_SEARCH.md). recall()/search-graph terms are overwhelmingly
     names of things already in the graph, so this turns the FIRST search for
     an already-known entity into a cache hit too, not just repeats.
 
@@ -1303,3 +1306,1008 @@ def link_code(neuron_id: str, symbol_id: str, repo: str,
         logger.warning(f"link_code: index update failed: {e}")
 
     return True, f"code_ref {symbol_id!r} linked to neuron {neuron_id}.{warning}"
+
+
+# ── Engram Layer: fold / unfold / folds ─────────────────────────────────────
+#
+# Short-term memory / context folding. See
+# _projects/knewrall-dev/plans/short-term-memory-layer-plan.md for the full
+# design. Thin wrappers over src/knewrall_engrams.py (the store) exported for
+# both cli.py and mcp_server.py's read-only knewrall_unfold tool.
+
+_DEFAULT_ENGRAMS_CONFIG: Dict[str, Any] = {
+    "ttl_hours": _engrams.DEFAULT_TTL_HOURS,
+    "session_idle_hours": _engrams.DEFAULT_SESSION_IDLE_HOURS,
+    "max_session_bytes": _engrams.DEFAULT_MAX_SESSION_BYTES,
+    "min_fold_bytes": 2048,
+    "min_fold_lines": 40,
+    "keep_head_lines": 20,
+    "keep_tail_lines": 20,
+    "unfold_max_chars": 40000,
+    "promote_hint_threshold": 2,
+    "never_fold_globs": [
+        "knewrall/schemas/**", "**/INSTRUCTIONS.md", "**/CLAUDE.md", "**/AGENTS.md",
+        "**/GEMINI.md", "**/.clinerules", "**/SKILL.md", ".claude/settings*.json",
+    ],
+    "enforce": False,
+    "enforce_patterns": ["pytest", "npm test", "cargo build", "docker logs", "tsc"],
+}
+
+
+def _engrams_config() -> Dict[str, Any]:
+    """Read the `engrams` tuning block from .knewrall/config.json, falling
+    back to the shipped defaults for anything missing. Read fresh on every
+    call (the file is tiny) so config edits take effect without a restart —
+    the same tradeoff recall()'s budgeting constants make by being module
+    constants, except this one source is user-editable, so freshness wins."""
+    cfg = dict(_DEFAULT_ENGRAMS_CONFIG)
+    config_path = get_root() / ".knewrall" / "config.json"
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cfg.update(data.get("engrams", {}))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return cfg
+
+
+def _is_never_fold_path(path: Optional[str], globs: List[str], root: Path) -> bool:
+    """Rule 2 (instruction-context protection): these files ARE the system
+    prompt in this workspace — fold/fold-run must refuse to fold them.
+
+    Matching is against EVERY path suffix, not just (basename,
+    relative-to-knewrall-root, absolute). `fnmatch` requires a full match, so
+    anchoring matters: the shipped `never_fold_globs` mix patterns written
+    relative to the *workspace* root (`knewrall/schemas/**`,
+    `.claude/settings*.json` — both one level ABOVE knewrall/, so
+    `relative_to(root)` raises and the absolute path can't full-match either)
+    with `**/`-prefixed ones (`**/INSTRUCTIONS.md`). Testing all suffixes makes
+    every pattern in that list work regardless of which root it was written
+    against, which is what a user editing `never_fold_globs` will expect.
+    `root` is retained for call-site compatibility (a suffix match subsumes
+    the relative-to-root case)."""
+    if not path:
+        return False
+    p = Path(path)
+    try:
+        abs_posix = p.resolve().as_posix()
+    except (OSError, RuntimeError):
+        abs_posix = p.as_posix()
+    segments = [s for s in abs_posix.split("/") if s]
+    candidates = [abs_posix, p.as_posix(), p.name]
+    candidates += ["/".join(segments[i:]) for i in range(len(segments))]
+    for pattern in globs:
+        for candidate in candidates:
+            if fnmatch.fnmatch(candidate, pattern):
+                return True
+    return False
+
+
+def _is_knewrall_invocation(cmd: Optional[str]) -> bool:
+    """Rule 3 (knewrall-output protection): never fold Knewrall's own output
+    — recall() is already budgeted, and folding it would recompress a
+    compressed artifact (and risks an obvious recursion)."""
+    if not cmd:
+        return False
+    return "knewrall.py" in cmd or bool(re.match(r"^\s*knewrall(\s|$)", cmd))
+
+
+def render_fold_marker(header: Dict[str, Any], *, quiet: bool = False) -> str:
+    """What actually lands in the agent's context after a fold — see plan
+    §4.1. `--quiet` drops everything but the retrieval key."""
+    key = header["key"]
+    if quiet:
+        return f"↩ {key}"
+    lines = [
+        f"[folded → engram {key} ({header['kind']}, {header['bytes']} bytes ≈ {header['est_tokens']} tok)]",
+    ]
+    if header.get("digest"):
+        lines.append(f"digest: {header['digest']}")
+    lines.append(f"retrieve: python knewrall/bin/knewrall.py unfold {key} [--grep PATTERN] [--lines A-B]")
+    return "\n".join(lines)
+
+
+def _fold_payload(
+    payload_bytes: bytes,
+    source: Dict[str, Any],
+    *,
+    label: str = "",
+    kind: Optional[str] = None,
+    session: Optional["_engrams.Session"] = None,
+    session_id: Optional[str] = None,
+    root: Optional[Path] = None,
+    quiet: bool = False,
+) -> Dict[str, Any]:
+    """Shared core of `fold()` and `precompact_ingest()`: apply protection
+    rules 1-3/6, classify+digest, and write the engram. Pulled out so the
+    transcript ingester (Phase 3b) reuses the exact same protection logic
+    instead of a second, potentially-drifting copy of it.
+
+    Returns a dict:
+      passthrough=True  -> {"passthrough": True, "content": str, "warning"?: str}
+      passthrough=False -> {"passthrough": False, "key": str, "marker": str, "meta": dict}
+    """
+    root = root or get_root()
+    cfg = _engrams_config()
+
+    # Rule 3: never re-fold Knewrall's own output.
+    if _is_knewrall_invocation(source.get("cmd")):
+        return {"passthrough": True, "content": payload_bytes.decode("utf-8", errors="replace")}
+
+    # Rule 2: instruction-context files ARE the system prompt — refuse.
+    if _is_never_fold_path(source.get("path"), cfg["never_fold_globs"], root):
+        return {
+            "passthrough": True,
+            "content": payload_bytes.decode("utf-8", errors="replace"),
+            "warning": f"refused to fold {source.get('path')} — instruction-context file, never folded",
+        }
+
+    num_lines = payload_bytes.count(b"\n") + (1 if payload_bytes and not payload_bytes.endswith(b"\n") else 0)
+    # Rule 1: size floor — the single most important protection. Below it,
+    # folding would cost more (the ~30-token marker) than it saves.
+    if len(payload_bytes) < cfg["min_fold_bytes"] and num_lines < cfg["min_fold_lines"]:
+        return {"passthrough": True, "content": payload_bytes.decode("utf-8", errors="replace")}
+
+    # Rule 6: path-based (not checksum-based) already-durable protection.
+    protected = _engrams.is_protected_path(source.get("path"), root=root)
+
+    detected_kind, digest, keywords = _fold_router.classify_and_digest(
+        payload_bytes, source, kind_override=kind,
+    )
+    meta = {
+        "kind": detected_kind,
+        "source": source,
+        "label": label,
+        "digest": digest,
+        "keywords": keywords,
+        "protected": protected,
+    }
+
+    session = session or _engrams.resolve_session(
+        root=root, session_id=session_id, idle_hours=cfg["session_idle_hours"], harness="cli",
+    )
+    try:
+        _engrams.sweep_expired(root=root, ttl_hours=cfg["ttl_hours"])  # opportunistic, best-effort
+    except Exception:
+        pass
+
+    try:
+        key = _engrams.write_engram(
+            payload_bytes, meta, session=session, root=root,
+            ttl_hours=cfg["ttl_hours"], max_session_bytes=cfg["max_session_bytes"],
+        )
+    except _engrams.EngramStoreFull as e:
+        return {
+            "passthrough": True,
+            "content": payload_bytes.decode("utf-8", errors="replace"),
+            "warning": f"fold refused: {e}",
+        }
+
+    header = _engrams.read_meta(key, session=session, root=root)
+    _engrams.record_adaptive_fold(root, detected_kind, source.get("cmd"))
+    marker = render_fold_marker(header, quiet=quiet)
+    return {"passthrough": False, "key": key, "marker": marker, "meta": header}
+
+
+def fold(
+    *,
+    content: Optional[str] = None,
+    file: Optional[str] = None,
+    label: str = "",
+    kind: Optional[str] = None,
+    session_id: Optional[str] = None,
+    quiet: bool = False,
+) -> Dict[str, Any]:
+    """Fold content the agent already has (stdin) or a file it's about to
+    read into an engram, returning a compact retrieval marker instead of the
+    raw content. No-ops (passthrough, no engram created) below the size
+    floor, or for protected instruction-context / knewrall-output paths —
+    see plan §3.2 rules 1-3.
+
+    Returns a dict:
+      passthrough=True  -> {"passthrough": True, "content": str, "warning"?: str}
+      passthrough=False -> {"passthrough": False, "key": str, "marker": str, "meta": dict}
+    """
+    root = get_root()
+
+    if file is not None:
+        try:
+            with open(file, "rb") as f:
+                payload_bytes = f.read()
+        except OSError as e:
+            return {"passthrough": True, "content": "", "warning": f"cannot read {file}: {e}"}
+        source = {"tool": "Read", "cmd": None, "path": str(Path(file).resolve()), "cwd": os.getcwd()}
+    else:
+        payload_bytes = (content or "").encode("utf-8")
+        source = {"tool": "stdin", "cmd": None, "path": None, "cwd": os.getcwd()}
+
+    return _fold_payload(
+        payload_bytes, source, label=label, kind=kind, session_id=session_id, root=root, quiet=quiet,
+    )
+
+
+def unfold(
+    key: str,
+    *,
+    session_id: Optional[str] = None,
+    grep: Optional[str] = None,
+    grep_context: int = 0,
+    lines: Optional[Tuple[int, int]] = None,
+    head: Optional[int] = None,
+    tail: Optional[int] = None,
+    meta_only: bool = False,
+    max_chars: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Read a folded payload back, windowed by default (unfold_max_chars) —
+    see plan §4.2. `unfold_max_chars` is enforced HERE (not left to the
+    caller) so both the CLI and the MCP `knewrall_unfold` tool get the same
+    cap automatically, since MCP responses are injected whole.
+
+    Returns {"found": False, "error": str} on an unknown key, or
+    {"found": True, "meta": dict, "content": str|None, "truncated": bool}.
+    """
+    root = get_root()
+    cfg = _engrams_config()
+
+    session = _engrams.resolve_session(root=root, session_id=session_id, touch=False)
+
+    try:
+        _engrams.sweep_expired(root=root, ttl_hours=cfg["ttl_hours"])  # opportunistic, best-effort
+    except Exception:
+        pass
+
+    try:
+        if meta_only:
+            meta = _engrams.read_meta(key, session=session, root=root)
+            return {"found": True, "meta": meta, "content": None, "truncated": False}
+
+        # A bare unfold (no --grep/--lines) is capped at unfold_max_chars;
+        # a windowed one is already byte-cheap and left uncapped.
+        cap = max_chars
+        if cap is None and grep is None and lines is None and head is None and tail is None:
+            cap = cfg["unfold_max_chars"]
+
+        result = _engrams.read_engram(
+            key, session=session, root=root, head=head, tail=tail, lines=lines,
+            grep=grep, grep_context=grep_context, max_chars=cap,
+        )
+    except _engrams.EngramNotFound:
+        return {
+            "found": False,
+            "error": (
+                f"engram {key} not found (expired or discarded — or never existed on this "
+                "machine: engrams are per-machine and never synced; if this key came from "
+                "another machine, `consolidate` it there first)"
+            ),
+        }
+
+    _engrams.mark_unfolded(key, session=session, root=root, ttl_hours=cfg["ttl_hours"])
+    header_kind = result.get("meta", {}).get("kind", "prose")
+    header_cmd = (result.get("meta", {}).get("source") or {}).get("cmd")
+    _engrams.record_adaptive_unfold(root, header_kind, header_cmd)
+    result["found"] = True
+    return result
+
+
+def _shape_fold_summary(header: Dict[str, Any]) -> Dict[str, Any]:
+    """Flat, scalar-only subset for `folds` output — see plan §4.3's example
+    columns (key,kind,label,lines,est_tokens,unfolds,created_at). Flat/scalar
+    is also what unlocks knewrall_toon's compact tabular block for a uniform
+    array; the full merged header (with nested `source`, `keywords` list) is
+    still available via `unfold --meta`/read_meta()."""
+    return {
+        "key": header["key"],
+        "kind": header["kind"],
+        "label": header.get("label", ""),
+        "lines": header.get("lines", 0),
+        "est_tokens": header.get("est_tokens", 0),
+        "unfolds": header.get("unfolds", 0),
+        "created_at": header.get("created_at", ""),
+    }
+
+
+# ── PreCompact transcript ingestion (Phase 3b) ──────────────────────────────
+#
+# Makes the harness's own context-shedding lossless: fold tool results out of
+# the transcript BEFORE Claude Code compacts them away, so compaction becomes
+# reversible instead of destructive. Every token here has already been paid
+# for — the buy is reversibility, not savings (plan §2.1 mechanism C, §9
+# Phase 3b). Format gated on parsing real transcripts from
+# ~/.claude/projects/**/*.jsonl (not a hand-written fixture) since the .jsonl
+# shape is undocumented. Confirmed shape, per-line JSON records:
+#   {"type": "assistant", "message": {"content": [{"type": "tool_use",
+#     "id": ..., "name": "Bash"|"Read"|..., "input": {"command"|"file_path": ...}}]}}
+#   {"type": "user", "promptId": ..., "cwd": ..., "message": {"content":
+#     [{"type": "tool_result", "tool_use_id": ..., "content": <str or list
+#       of {"type":"text","text":...}/{"type":"tool_reference",...} blocks>}]}}
+# `assistant` records never carry `promptId` (only `user` records do); "turn"
+# boundaries are therefore reconstructed from the distinct promptIds seen on
+# `user` records, in file order.
+
+def _iter_transcript_records(transcript_path: str):
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue  # unrecognized/corrupt line — degrade to no ingestion for it, not a crash
+
+
+def _extract_tool_result_text(content: Any) -> Optional[str]:
+    """`content` is either a plain string, or a list of content blocks — only
+    `text` blocks contribute (e.g. `tool_reference` blocks, seen when a
+    deferred-tool search result is fed back, carry no foldable text)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block["text"] for block in content
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def precompact_ingest(
+    transcript_path: str,
+    *,
+    session_id: Optional[str] = None,
+    root: Optional[Path] = None,
+    keep_tail_turns: int = 3,
+    deadline_seconds: float = 10.0,
+) -> Dict[str, int]:
+    """Fold a transcript's tool results into engrams before the harness
+    compacts them away. Best-effort and defensive throughout: an unrecognized
+    record shape is skipped (never raised), a missing/unreadable file returns
+    zero counters, and a hard wall-clock deadline caps total work on a large
+    transcript. Reuses `_fold_payload()` — same protection rules 1-3/6 as
+    every other fold path, so an ingested tool result can no more evade the
+    size floor or instruction-context refusal than a manual `fold` call.
+
+    Skips the last `keep_tail_turns` turns entirely (protection rule 4 — the
+    model still needs that content verbatim; "turn" = one distinct
+    `promptId`, in file order).
+    """
+    import time as _time
+
+    root = root or get_root()
+    stats = {
+        "records_seen": 0, "tool_results_seen": 0, "folded": 0,
+        "skipped_tail": 0, "skipped_other": 0, "parse_errors": 0,
+    }
+
+    try:
+        records = list(_iter_transcript_records(transcript_path))
+    except OSError:
+        return stats
+
+    prompt_order: List[str] = []
+    for rec in records:
+        pid = rec.get("promptId")
+        if pid and (not prompt_order or prompt_order[-1] != pid):
+            prompt_order.append(pid)
+    tail_prompt_ids = set(prompt_order[-keep_tail_turns:]) if keep_tail_turns > 0 else set()
+
+    session = _engrams.resolve_session(root=root, session_id=session_id, touch=False)
+    tool_use_map: Dict[str, Tuple[Optional[str], Dict[str, Any]]] = {}
+    start = _time.monotonic()
+
+    for rec in records:
+        if _time.monotonic() - start > deadline_seconds:
+            break
+        stats["records_seen"] += 1
+        try:
+            rec_type = rec.get("type")
+            if rec_type == "assistant":
+                msg = rec.get("message") or {}
+                for block in (msg.get("content") or []):
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_use_map[block.get("id")] = (block.get("name"), block.get("input") or {})
+                continue
+
+            if rec_type != "user":
+                continue
+            msg = rec.get("message") or {}
+            content_blocks = msg.get("content")
+            if not isinstance(content_blocks, list):
+                continue
+
+            pid = rec.get("promptId")
+            for block in content_blocks:
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                stats["tool_results_seen"] += 1
+                if pid and pid in tail_prompt_ids:
+                    stats["skipped_tail"] += 1
+                    continue
+
+                text = _extract_tool_result_text(block.get("content"))
+                if not text:
+                    stats["skipped_other"] += 1
+                    continue
+
+                tool_use_id = block.get("tool_use_id")
+                tool_name, tool_input = tool_use_map.get(tool_use_id, (None, {}))
+                source = {
+                    "tool": tool_name,
+                    "cmd": tool_input.get("command"),
+                    "path": tool_input.get("file_path") or tool_input.get("path"),
+                    "cwd": rec.get("cwd"),
+                }
+                result = _fold_payload(
+                    text.encode("utf-8", errors="replace"), source,
+                    label=f"transcript ingestion ({tool_name or 'tool'})",
+                    session=session, root=root,
+                )
+                if result.get("passthrough"):
+                    stats["skipped_other"] += 1
+                else:
+                    stats["folded"] += 1
+        except Exception:
+            stats["parse_errors"] += 1
+            continue
+
+    return stats
+
+
+def fold_run(
+    command: List[str],
+    *,
+    label: str = "",
+    kind: Optional[str] = None,
+    keep_head: Optional[int] = None,
+    keep_tail: Optional[int] = None,
+    session_id: Optional[str] = None,
+    quiet: bool = False,
+) -> Dict[str, Any]:
+    """Run `command`, fold its full (stdout+stderr, combined) output as an
+    engram, and return head + tail + a type-aware digest + a retrieval
+    marker — the raw output never enters the caller's context at all. See
+    plan §2.1 mechanism A and §4.1's marker format.
+
+    Streams the subprocess's combined output to a temp file rather than
+    buffering it in memory (a `docker logs` can be gigabytes), decodes with
+    errors="replace", and passes exit codes through unchanged.
+
+    Returns:
+      {"exit_code": int, "passthrough": bool, "output": str, "key"?: str, "meta"?: dict}
+    `output` is exactly what the caller should print — either the raw
+    command output (passthrough) or the folded transcript (head/tail/digest/
+    marker).
+    """
+    import subprocess
+    import tempfile
+
+    root = get_root()
+    cfg = _engrams_config()
+    display_cmd = " ".join(command)
+
+    if _is_knewrall_invocation(display_cmd):
+        return {
+            "exit_code": 1, "passthrough": True,
+            "output": f"$ {display_cmd}\n[refused: fold-run does not wrap Knewrall's own CLI]",
+        }
+
+    with tempfile.NamedTemporaryFile(mode="w+b", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            proc = subprocess.run(command, stdout=tmp, stderr=subprocess.STDOUT, cwd=os.getcwd())
+            exit_code = proc.returncode
+        except OSError as e:
+            tmp_path.unlink(missing_ok=True)
+            return {"exit_code": 127, "passthrough": True, "output": f"$ {display_cmd}\n[error: {e}]"}
+
+    try:
+        payload_bytes = tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    text = payload_bytes.decode("utf-8", errors="replace")
+    num_lines = payload_bytes.count(b"\n") + (1 if payload_bytes and not payload_bytes.endswith(b"\n") else 0)
+
+    if len(payload_bytes) < cfg["min_fold_bytes"] and num_lines < cfg["min_fold_lines"]:
+        # Rule 1: size floor — the command already ran; nothing to fold.
+        return {"exit_code": exit_code, "passthrough": True, "output": f"$ {display_cmd}\n{text}"}
+
+    source = {"tool": "Bash", "cmd": display_cmd, "path": None, "cwd": os.getcwd()}
+    detected_kind, digest, keywords = _fold_router.classify_and_digest(
+        payload_bytes, source, kind_override=kind,
+    )
+    meta = {
+        "kind": detected_kind, "source": source, "label": label,
+        "digest": digest, "keywords": keywords, "protected": False,
+    }
+
+    session = _engrams.resolve_session(
+        root=root, session_id=session_id, idle_hours=cfg["session_idle_hours"], harness="cli",
+    )
+    try:
+        _engrams.sweep_expired(root=root, ttl_hours=cfg["ttl_hours"])
+    except Exception:
+        pass
+
+    try:
+        key = _engrams.write_engram(
+            payload_bytes, meta, session=session, root=root,
+            ttl_hours=cfg["ttl_hours"], max_session_bytes=cfg["max_session_bytes"],
+        )
+    except _engrams.EngramStoreFull as e:
+        return {
+            "exit_code": exit_code, "passthrough": True,
+            "output": f"$ {display_cmd}\n{text}\n[fold refused: {e}]",
+        }
+
+    header = _engrams.read_meta(key, session=session, root=root)
+    _engrams.record_adaptive_fold(root, detected_kind, display_cmd)
+
+    # TOIN-lite adaptive widening (plan §5.2): if this (kind, cmd_pattern)
+    # pair's unfold_rate has run hot over enough samples, keep more head/tail
+    # for FUTURE folds of it — explicit caller overrides always win.
+    default_head, default_tail = cfg["keep_head_lines"], cfg["keep_tail_lines"]
+    if keep_head is None or keep_tail is None:
+        adaptive_head, adaptive_tail = _engrams.adaptive_keep_lines(
+            root, detected_kind, display_cmd, default_head, default_tail,
+        )
+    head_n = keep_head if keep_head is not None else adaptive_head
+    tail_n = keep_tail if keep_tail is not None else adaptive_tail
+    lines = text.split("\n")
+    head_block = "\n".join(lines[:head_n])
+    tail_block = "\n".join(lines[-tail_n:]) if tail_n else ""
+
+    if quiet:
+        transcript = [f"$ {display_cmd}", head_block, f"↩ {key}"]
+    else:
+        transcript = [
+            f"$ {display_cmd}",
+            head_block,
+            f"[…{header['lines']} lines folded → engram {key} "
+            f"({header['kind']}, {_fmt_bytes(header['bytes'])} ≈ {header['est_tokens']:,} tok)…]",
+        ]
+        if digest:
+            transcript.append(f"digest: {digest}")
+        if tail_block:
+            transcript.append(tail_block)
+        transcript.append(f"retrieve: python knewrall/bin/knewrall.py unfold {key} [--grep PATTERN] [--lines A-B]")
+
+    return {
+        "exit_code": exit_code, "passthrough": False,
+        "output": "\n".join(transcript), "key": key, "meta": header,
+    }
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+_FOLD_SCAN_MAX_ITEMS = 4
+_FOLD_SCAN_MAX_CHARS = 2000
+_FOLD_SCAN_DEADLINE = 1.5  # wall-clock cap on the ranking work itself, measured
+                            # from inside this function (post-import) — the
+                            # observed hook-to-hook latency also includes
+                            # interpreter cold-start, which this deadline does
+                            # NOT cover (see knewrall_fold_turn.py's docstring).
+
+
+def _score_engram(header: Dict[str, Any], terms_lower: List[str]) -> Tuple[float, List[str]]:
+    """Weighted literal overlap — keyword hit > label hit > digest hit —
+    boosted by recency and by unfolds. Deliberately no IDF (plan §6, Kimi K3
+    I4): at a session's corpus size (tens of engrams), IDF is sampling noise,
+    not signal."""
+    keywords = [k.lower() for k in header.get("keywords", [])]
+    label = (header.get("label") or "").lower()
+    digest = (header.get("digest") or "").lower()
+
+    score = 0.0
+    matched: List[str] = []
+    for t in terms_lower:
+        hit = False
+        if any(t == kw or t in kw or kw in t for kw in keywords):
+            score += 3
+            hit = True
+        if t in label:
+            score += 2
+            hit = True
+        if t in digest:
+            score += 1
+            hit = True
+        if hit:
+            matched.append(t)
+
+    if not matched:
+        return 0.0, []
+
+    try:
+        created = _engrams._parse_iso(header["created_at"])
+        age_hours = (_engrams._now() - created).total_seconds() / 3600.0
+        recency_boost = max(0.0, 2.0 - (age_hours / 24.0))  # decays over ~2 days
+    except (KeyError, ValueError):
+        recency_boost = 0.0
+
+    unfolds_boost = min(3, header.get("unfolds", 0)) * 0.5
+    return score + recency_boost + unfolds_boost, matched
+
+
+def fold_scan(
+    terms: List[str],
+    *,
+    session_id: Optional[str] = None,
+    root: Optional[Path] = None,
+    max_items: int = _FOLD_SCAN_MAX_ITEMS,
+    max_chars: int = _FOLD_SCAN_MAX_CHARS,
+    deadline_seconds: float = _FOLD_SCAN_DEADLINE,
+    min_age_seconds: float = 3.0,
+) -> Dict[str, Any]:
+    """The Context Tracker analogue (plan §6): rank the current session's
+    engram HEADERS (never blobs) by relevance to `terms`, emit at most
+    `max_items` one-line markers within `max_chars` total. Surfaces pointers
+    only — never content; unfolding is always the model's own decision.
+
+    `min_age_seconds` implements protection rule 4 (own-turn protection): an
+    engram folded moments ago (effectively "this turn", since fold-scan fires
+    at the START of the next turn) is excluded — the model still has that
+    content fresh, it doesn't need a pointer back to it.
+    """
+    import time
+
+    root = root or get_root()
+    start = time.monotonic()
+    terms_lower = [t.lower() for t in terms if t]
+    if not terms_lower:
+        return {"markers": [], "text": ""}
+
+    session = _engrams.resolve_session(root=root, session_id=session_id, touch=False)
+    # A high limit rather than "unlimited": ranking needs every candidate in
+    # scope, and a session's engram count is realistically tens-to-hundreds.
+    headers = _engrams.list_engrams(session=session, root=root, limit=100000)
+
+    now = _engrams._now()
+    scored = []
+    for header in headers:
+        if time.monotonic() - start > deadline_seconds:
+            break
+        try:
+            created = _engrams._parse_iso(header["created_at"])
+            if (now - created).total_seconds() < min_age_seconds:
+                continue
+        except (KeyError, ValueError):
+            pass
+        score, matched = _score_engram(header, terms_lower)
+        if score > 0:
+            scored.append((score, header, matched))
+
+    scored.sort(key=lambda x: -x[0])
+
+    lines: List[str] = []
+    emitted: List[str] = []
+    total_chars = 0
+    for score, header, matched in scored:
+        if len(emitted) >= max_items:
+            break
+        label_or_digest = header.get("label") or header.get("digest", "")
+        preview = label_or_digest[:40]
+        line = (
+            f"  {header['key']} {header['kind']} \"{preview}\" — "
+            f"matches: {', '.join(matched)}  → unfold {header['key']}"
+        )
+        if total_chars + len(line) + 1 > max_chars:
+            break
+        lines.append(line)
+        total_chars += len(line) + 1
+        emitted.append(header["key"])
+
+    if not lines:
+        return {"markers": [], "text": ""}
+
+    text = "possibly relevant folded context:\n" + "\n".join(lines)
+    return {"markers": emitted, "text": text}
+
+
+def list_folds(
+    *,
+    session_id: Optional[str] = None,
+    kind: Optional[str] = None,
+    grep: Optional[str] = None,
+    limit: int = 20,
+    all_sessions: bool = False,
+) -> Dict[str, Any]:
+    """This session's fold index (metadata only — never payloads), plus a
+    token-savings total. See plan §4.3."""
+    root = get_root()
+    session = None
+    if not all_sessions:
+        session = _engrams.resolve_session(root=root, session_id=session_id, touch=False)
+
+    engrams = _engrams.list_engrams(session=session, root=root, kind=kind, grep=grep, limit=limit)
+
+    folded_tokens = sum(e.get("est_tokens", 0) for e in engrams)
+    # Retained ~= what actually stays in context per fold: the marker
+    # overhead (~30 tok) plus the digest text. Rough, deliberately crude,
+    # matching est_tokens' own bytes/4 house style.
+    retained_tokens = sum(30 + (len(e.get("digest", "")) // 4) for e in engrams)
+
+    return {
+        "session": session.session_short if session else "all",
+        "engrams": [_shape_fold_summary(e) for e in engrams],
+        "totals": {
+            "engrams": len(engrams),
+            "folded_tokens": folded_tokens,
+            "retained_tokens": retained_tokens,
+            "saved_tokens": max(0, folded_tokens - retained_tokens),
+        },
+    }
+
+
+# ── consolidate: the bridge back to the durable graph (Phase 4) ────────────
+#
+# Deliberately a thin wrapper over propose_node()/propose_link() — creates
+# nothing the graph doesn't already understand (plan §5.1). No new
+# node-creation code path, no new schema, no new validation.
+
+_KIND_TO_PILLAR_HINT = {
+    # INSTRUCTIONS §2's pillar-mapping for dev-evolution concepts, applied to
+    # engram kinds: most folded content describes an artifact/concept (What).
+    "diff": "How", "run_log": "How",
+}
+
+
+def _suggest_node_payload(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Draft a `propose-node` payload from an engram's kind/label/digest/
+    keywords. NEVER writes — the agent reviews, edits, and passes it to
+    `propose-node` itself (plan §5.1's `--suggest`)."""
+    kind = meta.get("kind", "prose")
+    label = meta.get("label") or f"{kind} engram {meta.get('key', '')}"
+    digest = meta.get("digest", "")
+    keywords = meta.get("keywords") or []
+    pillar = _KIND_TO_PILLAR_HINT.get(kind, "What")
+    return {
+        "header": {"type": pillar, "canonical_name": label, "aliases": []},
+        "descriptions": {"conceptual": digest},
+        "properties": {
+            "source_kind": [{"value": kind}],
+            "keywords": [{"value": kw} for kw in keywords],
+        },
+        "tags": [kind, "from-engram"],
+    }
+
+
+def consolidate_engram(
+    key: str,
+    *,
+    json_payload: Optional[Dict[str, Any]] = None,
+    suggest: bool = False,
+    archive: bool = False,
+    archive_only: bool = False,
+    link: Optional[Tuple[str, str]] = None,
+    session_id: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Promote an engram into the durable graph. Three modes (plan §5.1):
+      - `suggest=True`            -> draft payload only, never writes.
+      - `archive_only=True`       -> copy raw blob to archive/, no Neuron.
+      - `json_payload=<dict>`     -> propose_node(payload) (+ optional
+                                      --archive, + optional --link).
+    """
+    root = root or get_root()
+    session = _engrams.resolve_session(root=root, session_id=session_id, touch=False)
+
+    try:
+        meta = _engrams.read_meta(key, session=session, root=root)
+    except _engrams.EngramNotFound:
+        return {"success": False, "message": f"engram {key} not found (expired, discarded, or never existed on this machine)"}
+
+    if suggest:
+        return {"success": True, "mode": "suggest", "draft": _suggest_node_payload(meta)}
+
+    engram_path = _engrams._find_engram_path(key, session, root)
+
+    if archive_only:
+        _, payload_bytes = _engrams._read_header_and_payload(engram_path)
+        archived_path = _engrams.archive_engram(key, meta, payload_bytes, root)
+        _engrams.update_engram_state(key, session=session, root=root, archived_path=archived_path)
+        return {"success": True, "mode": "archive-only", "archived_path": archived_path}
+
+    if json_payload is None:
+        return {"success": False, "message": "consolidate requires one of --json/--suggest/--archive-only"}
+
+    if "system" in json_payload:
+        return {"success": False, "message": "payload must not contain system — propose_node generates it"}
+
+    success, msg, node_id = propose_node(json_payload)
+    if not success:
+        return {"success": False, "message": msg}
+
+    archived_path = None
+    if archive:
+        _, payload_bytes = _engrams._read_header_and_payload(engram_path)
+        archived_path = _engrams.archive_engram(key, meta, payload_bytes, root)
+        update_node_fields(node_id, {"properties": {"source_artifact": archived_path}})
+
+    _engrams.update_engram_state(key, session=session, root=root, consolidated_to=node_id, archived_path=archived_path)
+
+    link_message = None
+    if link:
+        target_id, predicate = link
+        _, link_message = propose_link(node_id, target_id, predicate)
+
+    return {
+        "success": True, "mode": "json", "node_id": node_id, "message": msg,
+        "archived_path": archived_path, "link_message": link_message,
+    }
+
+
+# ── fold-gc: explicit discard (Phase 4) ─────────────────────────────────────
+
+def fold_gc(
+    *,
+    session_id: Optional[str] = None,
+    all_sessions: bool = False,
+    older_than_hours: Optional[float] = None,
+    keep_consolidated: bool = True,
+    purge_consolidated: bool = False,
+    dry_run: bool = False,
+    root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Discard engrams. `--keep-consolidated` (default on) preserves engrams
+    with a non-null consolidated_to/archived_path INDEFINITELY, until an
+    explicit `--purge-consolidated` — never a "survives one extra cycle"
+    half-measure (plan §7.2, Kimi K3 I5). Protected engrams are never swept
+    here either, matching sweep_expired()'s own invariant."""
+    import shutil as _shutil
+
+    root = root or get_root()
+    eroot = _engrams.engrams_root(root)
+    stats = {
+        "sessions_scanned": 0, "sessions_deleted": 0, "engrams_deleted": 0,
+        "engrams_kept": 0, "bytes_freed": 0,
+    }
+    if not eroot.is_dir():
+        return stats
+
+    if all_sessions:
+        session_dirs = sorted({p.parent for p in eroot.glob("*/*/*/session.json")})
+    else:
+        session = _engrams.resolve_session(root=root, session_id=session_id, touch=False)
+        session_dirs = [_engrams.session_dir(session, root)]
+
+    now = _engrams._now()
+
+    for sdir in session_dirs:
+        manifest_path = sdir / "session.json"
+        manifest = _engrams._read_json(manifest_path)
+        if manifest is None:
+            continue
+        stats["sessions_scanned"] += 1
+        engrams = dict(manifest.get("engrams", {}))
+
+        for key, state in list(engrams.items()):
+            is_consolidated = bool(state.get("consolidated_to")) or bool(state.get("archived_path"))
+            if is_consolidated and keep_consolidated and not purge_consolidated:
+                stats["engrams_kept"] += 1
+                continue
+            if state.get("protected") and not purge_consolidated:
+                stats["engrams_kept"] += 1
+                continue
+
+            engram_path = sdir / f"{key}.engram"
+            if older_than_hours is not None:
+                if not engram_path.exists():
+                    continue
+                try:
+                    header = _engrams._read_header_only(engram_path)
+                    created = _engrams._parse_iso(header["created_at"])
+                except (OSError, KeyError, ValueError, __import__("json").JSONDecodeError):
+                    continue
+                age_hours = (now - created).total_seconds() / 3600.0
+                if age_hours < older_than_hours:
+                    stats["engrams_kept"] += 1
+                    continue
+
+            if dry_run:
+                stats["engrams_deleted"] += 1
+                continue
+
+            size = engram_path.stat().st_size if engram_path.exists() else 0
+            try:
+                if engram_path.exists():
+                    engram_path.unlink()
+            except OSError:
+                continue
+            engrams.pop(key, None)
+            stats["engrams_deleted"] += 1
+            stats["bytes_freed"] += size
+
+        if dry_run:
+            continue
+
+        manifest["engrams"] = engrams
+        manifest["engram_count"] = len(engrams)
+        # Recompute the byte/token totals from the SURVIVING engrams' headers
+        # rather than leaving them at their pre-GC values. write_engram()'s
+        # byte-cap check reads `bytes_folded` directly, so a stale (inflated)
+        # total makes a long-lived session evict live engrams — or refuse new
+        # folds outright with EngramStoreFull — long before it has actually
+        # reached max_session_bytes. Recomputing (instead of decrementing) is
+        # also self-healing for a manifest that already drifted.
+        surviving_bytes = 0
+        surviving_tokens = 0
+        for key in engrams:
+            try:
+                header = _engrams._read_header_only(sdir / f"{key}.engram")
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            surviving_bytes += header.get("bytes", 0)
+            surviving_tokens += header.get("est_tokens", 0)
+        manifest["bytes_folded"] = surviving_bytes
+        manifest["est_tokens_saved"] = surviving_tokens
+        if not engrams:
+            try:
+                _shutil.rmtree(sdir)
+                stats["sessions_deleted"] += 1
+            except OSError:
+                pass
+        else:
+            _engrams._atomic_write_bytes(
+                manifest_path,
+                (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+            )
+
+    return stats
+
+
+# ── fold-stats: visibility instead of a circuit-breaker (Phase 4, Q2) ──────
+
+def fold_stats(*, root: Optional[Path] = None) -> Dict[str, Any]:
+    """Per-kind fold/unfold counts, unfold rate, adaptive digest settings,
+    disk usage — across ALL live sessions. This is the visibility the plan
+    relies on instead of a token-based circuit-breaker (resolved Q2): the
+    real failure mode (a misleading digest) shows up here as an unusually
+    high unfold_rate for a (kind, cmd_pattern) pair, not as a token count."""
+    root = root or get_root()
+    eroot = _engrams.engrams_root(root)
+    stats: Dict[str, Any] = {
+        "sessions": 0, "engrams": 0, "bytes_folded": 0, "unfold_count": 0,
+        "consolidated": 0, "protected": 0, "by_kind": {}, "adaptive": {},
+    }
+    if not eroot.is_dir():
+        return stats
+
+    for manifest_path in eroot.glob("*/*/*/session.json"):
+        manifest = _engrams._read_json(manifest_path)
+        if manifest is None:
+            continue
+        stats["sessions"] += 1
+        sdir = manifest_path.parent
+        for key, state in manifest.get("engrams", {}).items():
+            engram_path = sdir / f"{key}.engram"
+            try:
+                header = _engrams._read_header_only(engram_path)
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            stats["engrams"] += 1
+            stats["bytes_folded"] += header.get("bytes", 0)
+            unfolds = state.get("unfolds", 0)
+            stats["unfold_count"] += unfolds
+            if state.get("consolidated_to"):
+                stats["consolidated"] += 1
+            if state.get("protected"):
+                stats["protected"] += 1
+            kind = header.get("kind", "prose")
+            bucket = stats["by_kind"].setdefault(kind, {"folds": 0, "unfolds": 0})
+            bucket["folds"] += 1
+            bucket["unfolds"] += unfolds
+
+    for kind, bucket in stats["by_kind"].items():
+        bucket["unfold_rate"] = round(bucket["unfolds"] / bucket["folds"], 3) if bucket["folds"] else 0.0
+
+    adaptive = _engrams._read_json(_engrams._adaptive_stats_path(root))
+    if adaptive:
+        stats["adaptive"] = adaptive
+
+    return stats

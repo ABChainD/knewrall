@@ -33,8 +33,27 @@ from .knewrall_middleware import (
     embed_code_symbols,
     embed_query_terms,
     embed_reconcile,
+    # Engram Layer (short-term memory / context folding)
+    fold,
+    fold_run,
+    unfold,
+    list_folds,
+    fold_scan,
+    consolidate_engram,
+    fold_gc,
+    fold_stats,
 )
 from .knewrall_toon import encode as encode_toon
+
+
+def _parse_duration_hours(text: str) -> float:
+    """Parse a duration like '24h' / '3d' / '90m' into hours."""
+    text = text.strip().lower()
+    units = {"h": 1.0, "d": 24.0, "m": 1.0 / 60.0}
+    if text and text[-1] in units:
+        return float(text[:-1]) * units[text[-1]]
+    return float(text)  # bare number -> hours
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -188,6 +207,93 @@ def main():
     update_note_parser = subparsers.add_parser("update-note-links", help="Append wikilinks to a markdown note")
     update_note_parser.add_argument("note_path", help="Relative path to note within notes/ directory")
     update_note_parser.add_argument("links", nargs="+", help="Canonical names to link")
+
+    # ── Engram Layer (short-term memory / context folding) ──────────────────
+
+    # fold — fold content you already have (stdin) or a file you're about to read
+    fold_parser = subparsers.add_parser(
+        "fold", help="Fold content (stdin) or a file into an engram; no-ops below the size floor")
+    fold_parser.add_argument("--label", default="", help="Why you folded this")
+    fold_parser.add_argument("--kind", default=None, help="Content kind override")
+    fold_parser.add_argument("--file", default=None, help="Fold this file instead of reading stdin")
+    fold_parser.add_argument("--quiet", action="store_true", help="Print only the retrieval key")
+    fold_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+
+    # fold-run — run a command, fold its full output, print head+tail+digest+marker
+    fold_run_parser = subparsers.add_parser(
+        "fold-run",
+        help="Run a command, fold its full output; the raw output never enters your context")
+    fold_run_parser.add_argument("--label", default="", help="Why you ran this")
+    fold_run_parser.add_argument("--kind", default=None, help="Content kind override")
+    fold_run_parser.add_argument("--keep-head", type=int, default=None, dest="keep_head")
+    fold_run_parser.add_argument("--keep-tail", type=int, default=None, dest="keep_tail")
+    fold_run_parser.add_argument("--quiet", action="store_true")
+    fold_run_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+    # dest="cmd_args" (NOT "command") — a positional named "command" here would
+    # clobber the top-level subparsers' dest="command" in the shared Namespace,
+    # since argparse merges all parsed args into one Namespace object.
+    fold_run_parser.add_argument("cmd_args", nargs=argparse.REMAINDER,
+                                 help="-- <command and args to run>")
+
+    # unfold — read folded content back
+    unfold_parser = subparsers.add_parser("unfold", help="Read folded content back by key")
+    unfold_parser.add_argument("key")
+    unfold_parser.add_argument("--grep", default=None, help="Matching lines with --context")
+    unfold_parser.add_argument("--context", type=int, default=0, dest="grep_context")
+    unfold_parser.add_argument("--lines", default=None, help="A-B byte-cheap slice")
+    unfold_parser.add_argument("--head", type=int, default=None)
+    unfold_parser.add_argument("--tail", type=int, default=None)
+    unfold_parser.add_argument("--max-chars", type=int, default=None, dest="max_chars")
+    unfold_parser.add_argument("--meta", action="store_true", dest="meta_only", help="Header only (TOON)")
+    unfold_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+
+    # folds — list this session's engrams
+    folds_parser = subparsers.add_parser("folds", help="List this session's engrams (metadata only, TOON)")
+    folds_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+    folds_parser.add_argument("--kind", default=None)
+    folds_parser.add_argument("--grep", default=None)
+    folds_parser.add_argument("--limit", type=int, default=20)
+    folds_parser.add_argument("--all", action="store_true", dest="all_sessions", help="List across all live sessions")
+
+    # fold-scan — budgeted relevance check: which folded content might matter to these terms
+    fold_scan_parser = subparsers.add_parser(
+        "fold-scan", help="Budgeted relevance check: which folded content might matter to these terms")
+    fold_scan_parser.add_argument("terms", nargs="+", help="One or more search terms")
+    fold_scan_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+
+    # consolidate — promote an engram into the durable graph
+    consolidate_parser = subparsers.add_parser(
+        "consolidate", help="Promote an engram into the durable graph (wraps propose-node/propose-link)")
+    consolidate_parser.add_argument("key", help="Engram key to consolidate")
+    consolidate_parser.add_argument(
+        "json_file", nargs="?", default=None,
+        help="Path to a JSON file with the node payload. Use '-' or omit (with --json unset) to read stdin.")
+    consolidate_parser.add_argument("--json", dest="json_inline", default=None,
+                                    help="Inline JSON payload string (alternative to a file/stdin).")
+    consolidate_parser.add_argument("--suggest", action="store_true",
+                                    help="Draft a propose-node payload from the engram's metadata; never writes.")
+    consolidate_parser.add_argument("--archive-only", action="store_true", dest="archive_only",
+                                    help="Copy the raw blob into archive/ without creating a Neuron.")
+    consolidate_parser.add_argument("--archive", action="store_true",
+                                    help="Also copy the raw blob into archive/ (combine with --json).")
+    consolidate_parser.add_argument("--link", nargs=2, metavar=("TARGET_ID", "PREDICATE"), default=None,
+                                    help="Also link the newly-created neuron to an existing one.")
+    consolidate_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+
+    # fold-gc — discard engrams
+    fold_gc_parser = subparsers.add_parser("fold-gc", help="Discard engrams (TTL sweeps also run opportunistically)")
+    fold_gc_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+    fold_gc_parser.add_argument("--all", action="store_true", dest="all_sessions", help="Operate across all live sessions")
+    fold_gc_parser.add_argument("--older-than", default=None, dest="older_than",
+                                help="Duration, e.g. 24h / 3d — only discard engrams older than this")
+    fold_gc_parser.add_argument("--keep-consolidated", dest="keep_consolidated", action="store_true", default=True,
+                                help="Preserve consolidated/archived engrams indefinitely (default on)")
+    fold_gc_parser.add_argument("--purge-consolidated", action="store_true", dest="purge_consolidated",
+                                help="Also discard consolidated/archived and protected engrams")
+    fold_gc_parser.add_argument("--dry-run", action="store_true", dest="dry_run")
+
+    # fold-stats — per-kind fold/unfold counts, unfold rate, disk usage
+    subparsers.add_parser("fold-stats", help="Per-kind fold/unfold counts, unfold rate, adaptive settings, disk usage")
 
     args = parser.parse_args()
 
@@ -418,6 +524,131 @@ def main():
         if do_terms:
             embedded, skipped = embed_query_terms()
             print(f"Query terms: embedded={embedded} skipped/unchanged={skipped}")
+
+    # ── Engram Layer commands ─────────────────────────────────────────────────
+
+    elif args.command == "fold":
+        content = None
+        if args.file is None:
+            content = sys.stdin.read()
+        result = fold(content=content, file=args.file, label=args.label, kind=args.kind,
+                      session_id=args.session_id, quiet=args.quiet)
+        if result.get("passthrough"):
+            sys.stdout.write(result["content"])
+            if result.get("warning"):
+                print(result["warning"], file=sys.stderr)
+        else:
+            print(result["marker"])
+
+    elif args.command == "fold-run":
+        command = args.cmd_args
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            print("Error: fold-run requires a command after --, e.g. "
+                  "`fold-run --label \"...\" -- pytest -q tests/`", file=sys.stderr)
+            sys.exit(2)
+        result = fold_run(command, label=args.label, kind=args.kind,
+                          keep_head=args.keep_head, keep_tail=args.keep_tail,
+                          session_id=args.session_id, quiet=args.quiet)
+        print(result["output"])
+        sys.exit(result["exit_code"])
+
+    elif args.command == "unfold":
+        lines_tuple = None
+        if args.lines:
+            try:
+                a, b = args.lines.split("-", 1)
+                lines_tuple = (int(a), int(b))
+            except ValueError:
+                print(f"Error: --lines must be A-B (got {args.lines!r})", file=sys.stderr)
+                sys.exit(1)
+        result = unfold(args.key, session_id=args.session_id, grep=args.grep,
+                        grep_context=args.grep_context, lines=lines_tuple,
+                        head=args.head, tail=args.tail, meta_only=args.meta_only,
+                        max_chars=args.max_chars)
+        if not result["found"]:
+            print(result["error"], file=sys.stderr)
+            sys.exit(1)
+        if args.meta_only:
+            print(encode_toon(result["meta"]), end="")
+        else:
+            print(result["content"])
+            if result.get("truncated"):
+                print("[truncated: use --lines or --grep to target]", file=sys.stderr)
+
+    elif args.command == "folds":
+        result = list_folds(session_id=args.session_id, kind=args.kind, grep=args.grep,
+                            limit=args.limit, all_sessions=args.all_sessions)
+        print(encode_toon(result), end="")
+
+    elif args.command == "fold-scan":
+        result = fold_scan(args.terms, session_id=args.session_id)
+        if result["text"]:
+            print(result["text"])
+
+    elif args.command == "consolidate":
+        json_payload = None
+        if not args.suggest and not args.archive_only:
+            try:
+                if args.json_inline is not None:
+                    raw = args.json_inline
+                    source = "--json"
+                elif args.json_file and args.json_file != "-":
+                    with open(args.json_file, 'r', encoding='utf-8') as f:
+                        raw = f.read()
+                    source = args.json_file
+                else:
+                    raw = sys.stdin.read()
+                    source = "stdin"
+                if not raw.strip():
+                    print(f"Error: no JSON payload provided via {source}.", file=sys.stderr)
+                    sys.exit(1)
+                json_payload = json.loads(raw)
+            except json.JSONDecodeError as e:
+                print(f"Error parsing JSON from {source}: {e}", file=sys.stderr)
+                sys.exit(1)
+            except OSError as e:
+                print(f"Error reading JSON file: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        link = tuple(args.link) if args.link else None
+        result = consolidate_engram(
+            args.key, json_payload=json_payload, suggest=args.suggest,
+            archive=args.archive, archive_only=args.archive_only,
+            link=link, session_id=args.session_id,
+        )
+        if not result.get("success"):
+            print(f"FAILURE: {result.get('message')}", file=sys.stderr)
+            sys.exit(1)
+        if result.get("mode") == "suggest":
+            print(encode_toon(result["draft"]), end="")
+        elif result.get("mode") == "archive-only":
+            print(f"SUCCESS: archived to {result['archived_path']}")
+        else:
+            print(f"SUCCESS: {result['message']}")
+            print(f"Node ID: {result['node_id']}")
+            if result.get("archived_path"):
+                print(f"Archived: {result['archived_path']}")
+            if result.get("link_message"):
+                print(f"Link: {result['link_message']}")
+
+    elif args.command == "fold-gc":
+        older_than_hours = _parse_duration_hours(args.older_than) if args.older_than else None
+        result = fold_gc(
+            session_id=args.session_id, all_sessions=args.all_sessions,
+            older_than_hours=older_than_hours, keep_consolidated=args.keep_consolidated,
+            purge_consolidated=args.purge_consolidated, dry_run=args.dry_run,
+        )
+        print(
+            f"Sessions: scanned={result['sessions_scanned']} deleted={result['sessions_deleted']} | "
+            f"Engrams: deleted={result['engrams_deleted']} kept={result['engrams_kept']} | "
+            f"Freed: {result['bytes_freed']} bytes"
+        )
+
+    elif args.command == "fold-stats":
+        result = fold_stats()
+        print(encode_toon(result), end="")
 
     else:
         parser.print_help()
