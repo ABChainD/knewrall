@@ -187,6 +187,46 @@ The pillars: **Who** (people, orgs, agents), **What** (objects, concepts, projec
 **Where** (locations, platforms), **When** (times, eras), **Why** (motivations,
 causes), **How** (methods, processes).
 
+### 4.1 Provenance & reified edges (assertions)
+
+Links and property values can carry an optional **`assertion`** block that records
+*where a claim came from and when it entered the KB* — distinct from `certainty`
+(epistemic stance) and from validity-time. All fields are optional and additive;
+existing neurons validate unchanged.
+
+- **`assertion.sources`** — array of **prefixed provenance strings**, whitelisted
+  prefixes `neuron:` `note:` `code:` `url:` `conv:` `text:` (e.g.
+  `note:notes/2026/08/x.md`, `code:<repo>::<qualified_name>`, `text:<free text>`).
+  Never dereferenced at write time; unresolvable `neuron:`/`code:` refs **warn, not
+  block**. The CLI sorts `sources` deterministically on every write.
+- **`assertion.recorded_at`** — transaction time, **enforced RFC 3339 date-time**
+  (e.g. `2026-08-08T10:00:00Z`); a bare/date-only string is rejected.
+- **`assertion.recorded_by`** — the **user's** identity that recorded the claim
+  (not an agent's). Optional today; reserved for multi-user support.
+- **`assertion.note`** — free-form annotation on this specific claim.
+
+Links additionally accept:
+- **`valid_from` / `valid_until`** — inline validity window, enforced RFC 3339
+  date-time (the lightweight alternative to a When-node link).
+- **`via_node_id`** — UUID back-pointer to the Why/How neuron that reifies this edge
+  (warn-not-block if dangling).
+
+**Reserved link predicates** — `supersedes` · `contradicts` · `corroborates` — model
+contradiction/supersession between claims. Rule (validator-enforced on both
+`propose-link` **and** inline links in `propose-node`): `direction` must be
+`outbound` and `certainty` must be present. `corroborates` adds weight/credibility
+to recorded knowledge. `recall` surfaces a node's own (outbound) reserved links under
+a `supersession` key, and the **reverse** view — claims that another neuron
+supersedes/contradicts/corroborates — under `reverse_claims` (each with a `relation`
+of `superseded_by` / `contradicted_by` / `corroborated_by`), so a superseded claim
+shows what replaced it.
+
+CLI: `propose-link` takes `--source-ref` (repeatable), `--recorded-at`,
+`--recorded-by`, `--note`, `--valid-from`, `--valid-until`, `--via-node-id`.
+Date fields (`recorded_at`, `valid_from`, `valid_until`) are enforced as real RFC
+3339 date-times on **every** write path (not just the schema). `recall` elides
+`assertion` blocks by default; pass `--include-assertions` to include them.
+
 ---
 
 ## 5. Extraction workflow

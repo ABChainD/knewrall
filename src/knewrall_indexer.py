@@ -28,6 +28,15 @@ DEFAULT_NEURONS_DIR = get_root() / "neurons"
 DEFAULT_NOTES_DIR = get_root() / "notes"
 DEFAULT_INDEX_DB_PATH = get_root() / ".knewrall" / "index.db"
 
+def _scalar_or_none(value):
+    """SQLite can only bind str/int/float/bytes/bool/None. A non-scalar (list or
+    dict) on a field meant to hold a scalar raises sqlite3.ProgrammingError, and
+    without a per-file guard that aborts indexing for the WHOLE corpus. Coerce
+    anything non-bindable to None so a single malformed on-disk field can't take
+    down refresh-index/rebuild-index (W1)."""
+    return value if isinstance(value, (str, int, float, bool, bytes, type(None))) else None
+
+
 # Wikilink pattern: [[canonical_name]] or [[canonical_name|display]]
 WIKILINK_PATTERN = re.compile(r'\[\[([^\[\]\|]+)(?:\|([^\[\]]+))?\]\]')
 # Standard markdown link pattern: [display](path)
@@ -46,15 +55,23 @@ def _hash_file(path: Path) -> str:
 
 
 def _peek_neuron_id(path: Path) -> Optional[str]:
-    """Read just system.id from a neuron JSON file already validated by
-    index_neuron_json — used so refresh_index() can record which node_id a
-    tracked file maps to without index_neuron_json needing to change its
-    return type."""
+    """Read just system.id from a neuron JSON file. Must be TOTAL (never raise):
+    refresh_index() calls it on files BEFORE they're validated — including
+    malformed ones — so it can preserve a present-but-unindexable file's prior
+    index row (V4). A non-dict payload (e.g. a JSON-array file) parses fine but
+    then `data.get(...)` would raise AttributeError; guarding only
+    JSONDecodeError/OSError let that abort the whole refresh (class-A, one
+    function over). Return None on anything unexpected."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("system", {}).get("id")
-    except (json.JSONDecodeError, OSError):
+        if not isinstance(data, dict):
+            return None
+        system = data.get("system")
+        if not isinstance(system, dict):
+            return None
+        return system.get("id")
+    except Exception:
         return None
 
 class KnewrallIndexer:
@@ -172,6 +189,11 @@ class KnewrallIndexer:
                 certainty TEXT NOT NULL,
                 tags TEXT,  -- JSON array
                 link_type TEXT NOT NULL,  -- 'node_link' or 'wikilink'
+                valid_from TEXT,
+                valid_until TEXT,
+                via_node_id TEXT,
+                recorded_at TEXT,
+                sources TEXT,  -- JSON array of prefixed source strings
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (source_id, target_id, predicate, link_type),
                 FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
@@ -182,6 +204,13 @@ class KnewrallIndexer:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_predicate ON edges(predicate)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_link_type ON edges(link_type)")
+        # On a pre-existing edges table the CREATE TABLE above is a no-op, so the
+        # reification columns are still absent — add them before the indexes that
+        # reference them, or CREATE INDEX raises "no such column: via_node_id"
+        # and aborts ensure_schema()/refresh_index() on every legacy index (F1).
+        self._add_missing_edge_columns(cursor)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_via_node_id ON edges(via_node_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_recorded_at ON edges(recorded_at)")
 
         self._create_index_files_table(cursor)
 
@@ -216,8 +245,41 @@ class KnewrallIndexer:
         aliases, edges, index_files) without touching existing data. Migrates
         an index.db created before index_files existed, and lets refresh_index()
         run against a brand-new db_path without a prior create_schema() call.
+        Also adds new columns to existing edges tables if missing.
         """
         self.create_schema(drop=False)
+        self._migrate_edges_columns()
+
+    # Reification columns added to `edges` after the original schema shipped.
+    # A pre-existing index.db predates these, so they must be ALTER-added
+    # before anything (notably the idx_edges_via_node_id / _recorded_at
+    # indexes) references them.
+    _EDGE_MIGRATION_COLUMNS = {
+        "valid_from": "TEXT",
+        "valid_until": "TEXT",
+        "via_node_id": "TEXT",
+        "recorded_at": "TEXT",
+        "sources": "TEXT",
+    }
+
+    def _add_missing_edge_columns(self, cursor) -> None:
+        """Idempotently ALTER-add any missing reification columns to an existing
+        `edges` table, operating on the caller's cursor. Called both from
+        create_schema() — before the new-column indexes, so a legacy table
+        doesn't raise "no such column" and abort refresh_index() (F1) — and
+        from _migrate_edges_columns()."""
+        cursor.execute("PRAGMA table_info(edges)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        for col, col_type in self._EDGE_MIGRATION_COLUMNS.items():
+            if col not in existing_cols:
+                cursor.execute(f"ALTER TABLE edges ADD COLUMN {col} {col_type}")
+
+    def _migrate_edges_columns(self) -> None:
+        """Add new columns to existing edges table if they don't exist yet."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        self._add_missing_edge_columns(cursor)
+        conn.commit()
 
     def index_neuron_json(self, file_path: Path) -> bool:
         """
@@ -284,46 +346,118 @@ class KnewrallIndexer:
         conn = self.connect()
         cursor = conn.cursor()
 
-        # Insert or replace node
-        cursor.execute("""
-            INSERT OR REPLACE INTO nodes
-            (id, type, canonical_name, full_legal_name, aliases, tags, descriptions, properties,
-             start_timestamp, end_timestamp, is_relative, anchor_node_id, latitude, longitude,
-             address, parent_location_id, role_history, source_node_id, target_node_id,
-             version, last_updated, checksum)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (node_id, node_type, canonical_name, full_legal_name, aliases_json,
-              tags_json, descriptions_json, properties_json,
-              start_ts, end_ts, is_rel, anchor_id, lat, lon,
-              addr, parent_loc, role_history_json, source_node_id, target_node_id,
-              version, last_updated, checksum))
+        # W1: one malformed on-disk file must never abort indexing for the WHOLE
+        # corpus. A non-scalar on any bindable field (or any other surprise)
+        # raises inside the driver; catch per-file, roll back this neuron's
+        # partial writes, and return False so refresh/rebuild skip it and carry
+        # on. The _scalar_or_none coercions below are the first line of defence
+        # (the link still indexes, just without the malformed field); this
+        # try/except is the backstop for anything they don't anticipate.
+        try:
+            # Insert or replace node
+            cursor.execute("""
+                INSERT OR REPLACE INTO nodes
+                (id, type, canonical_name, full_legal_name, aliases, tags, descriptions, properties,
+                 start_timestamp, end_timestamp, is_relative, anchor_node_id, latitude, longitude,
+                 address, parent_location_id, role_history, source_node_id, target_node_id,
+                 version, last_updated, checksum)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (node_id, node_type, canonical_name, full_legal_name, aliases_json,
+                  tags_json, descriptions_json, properties_json,
+                  _scalar_or_none(start_ts), _scalar_or_none(end_ts), is_rel, _scalar_or_none(anchor_id),
+                  _scalar_or_none(lat), _scalar_or_none(lon),
+                  _scalar_or_none(addr), _scalar_or_none(parent_loc), role_history_json,
+                  _scalar_or_none(source_node_id), _scalar_or_none(target_node_id),
+                  version, _scalar_or_none(last_updated), _scalar_or_none(checksum)))
 
-        # Insert aliases
-        cursor.execute("DELETE FROM aliases WHERE node_id = ?", (node_id,))
-        for alias in header.get('aliases', []):
-            if alias.strip():
-                cursor.execute("INSERT OR IGNORE INTO aliases (alias, node_id) VALUES (?, ?)",
-                               (alias.strip(), node_id))
+            # Insert aliases
+            cursor.execute("DELETE FROM aliases WHERE node_id = ?", (node_id,))
+            for alias in header.get('aliases', []):
+                if isinstance(alias, str) and alias.strip():
+                    cursor.execute("INSERT OR IGNORE INTO aliases (alias, node_id) VALUES (?, ?)",
+                                   (alias.strip(), node_id))
 
-        # Insert edges from links array
-        cursor.execute("DELETE FROM edges WHERE source_id = ? AND link_type = 'node_link'", (node_id,))
-        for link in data.get('links', []):
-            target_id = link.get('target_id')
-            predicate = link.get('predicate')
-            direction = link.get('direction')
-            certainty = link.get('certainty')
-            tags = json.dumps(link.get('tags', []), sort_keys=True)
+            # Insert edges from links array
+            cursor.execute("DELETE FROM edges WHERE source_id = ? AND link_type = 'node_link'", (node_id,))
+            for link in data.get('links', []):
+                target_id = link.get('target_id')
+                predicate = link.get('predicate')
+                direction = link.get('direction')
+                certainty = link.get('certainty')
+                tags = json.dumps(link.get('tags', []), sort_keys=True)
+                # Coerce every scalar-typed edge field so a non-scalar on disk
+                # (list/dict) nulls out rather than aborting the run (W1 — the
+                # same class Z1 fixed for `assertion`, now applied field-wide).
+                valid_from = _scalar_or_none(link.get('valid_from'))
+                valid_until = _scalar_or_none(link.get('valid_until'))
+                via_node_id = _scalar_or_none(link.get('via_node_id'))
+                # A malformed assertion (non-dict, or non-list `sources`) is
+                # tolerated: the link indexes without assertion metadata rather
+                # than crashing the corpus or indexing garbage chars (Z1).
+                assertion = link.get('assertion')
+                recorded_at = None
+                sources = None
+                if isinstance(assertion, dict):
+                    recorded_at = _scalar_or_none(assertion.get('recorded_at'))
+                    src = assertion.get('sources')
+                    if isinstance(src, list):
+                        sources = json.dumps(sorted(s for s in src if isinstance(s, str)))
 
-            if target_id and predicate and direction and certainty:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO edges
-                    (source_id, target_id, predicate, direction, certainty, tags, link_type)
-                    VALUES (?, ?, ?, ?, ?, ?, 'node_link')
-                """, (node_id, target_id, predicate, direction, certainty, tags))
+                if target_id and predicate and direction and certainty:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO edges
+                        (source_id, target_id, predicate, direction, certainty, tags, link_type,
+                         valid_from, valid_until, via_node_id, recorded_at, sources)
+                        VALUES (?, ?, ?, ?, ?, ?, 'node_link', ?, ?, ?, ?, ?)
+                    """, (node_id, target_id, predicate, direction, certainty, tags,
+                          valid_from, valid_until, via_node_id, recorded_at, sources))
 
-        conn.commit()
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to index neuron {node_id} from {file_path}: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+
         logger.debug(f"Indexed neuron {node_id} ({canonical_name})")
         return True
+
+    def _safe_index_neuron(self, json_file: Path) -> bool:
+        """Index one neuron with a guarantee that an exception ANYWHERE in the
+        parse/extract/insert — not just the DB section index_neuron_json already
+        guards — is contained to this one file. A single malformed neuron (a
+        non-dict `header`/`system`, a JSON-array file, a non-sortable `tags`,
+        etc.) must never abort refresh-index/rebuild-index for the whole corpus
+        (V1). Rolls back this file's partial transaction on failure and returns
+        False so the caller skips it and carries on."""
+        try:
+            return self.index_neuron_json(json_file)
+        except Exception as e:
+            logger.error(f"Failed to index neuron file {json_file}: {e}")
+            try:
+                self.connect().rollback()
+            except Exception:
+                pass
+            return False
+
+    def _safe_index_note(self, md_file: Path) -> bool:
+        """Notes counterpart to _safe_index_neuron (V7): a single malformed note
+        must never abort refresh-index/rebuild-index for the whole corpus. Most
+        notably index_markdown_note does `f.read()` with a strict utf-8 decode, so
+        a note with invalid bytes raises UnicodeDecodeError — but ANY exception is
+        contained here, rolled back, and reported as False so the caller carries
+        on."""
+        try:
+            return self.index_markdown_note(md_file)
+        except Exception as e:
+            logger.error(f"Failed to index note file {md_file}: {e}")
+            try:
+                self.connect().rollback()
+            except Exception:
+                pass
+            return False
 
     def index_markdown_note(self, file_path: Path) -> bool:
         """
@@ -433,7 +567,7 @@ class KnewrallIndexer:
                       if ".deleted" not in f.parts]
         logger.info(f"Found {len(json_files)} neuron JSON files.")
         for json_file in json_files:
-            self.index_neuron_json(json_file)
+            self._safe_index_neuron(json_file)  # V1: one bad file never aborts the rebuild
 
         # Index all markdown notes (recursing through date sub-folders).
         # Skip folder READMEs, which are documentation, not knowledge notes.
@@ -441,7 +575,7 @@ class KnewrallIndexer:
                     if f.name.lower() != "readme.md"]
         logger.info(f"Found {len(md_files)} markdown note files.")
         for md_file in md_files:
-            self.index_markdown_note(md_file)
+            self._safe_index_note(md_file)  # V7: one bad note never aborts the rebuild
 
         logger.info("Index rebuild completed.")
 
@@ -637,7 +771,16 @@ class KnewrallIndexer:
                     seen_node_ids.add(row["node_id"])
                 continue
             is_new = row is None
-            if not self.index_neuron_json(json_file):
+            # Peek the id BEFORE indexing so a present-but-unindexable file can
+            # still be marked "seen" (V4): otherwise the deletion pass below would
+            # treat this on-disk file as vanished, delete its existing index row,
+            # and prune its embedding — trading a loud failure for silent loss.
+            peeked_id = _peek_neuron_id(json_file) or (row["node_id"] if row else None)
+            if not self._safe_index_neuron(json_file):  # V1: contained per-file
+                if peeked_id:
+                    seen_node_ids.add(peeked_id)
+                logger.warning(f"Neuron {json_file} present but failed to index; "
+                               f"keeping its prior index row (not pruning).")
                 continue
             node_id = _peek_neuron_id(json_file)
             if node_id:
@@ -663,7 +806,7 @@ class KnewrallIndexer:
                 stats["notes_unchanged"] += 1
                 continue
             is_new = row is None
-            if not self.index_markdown_note(md_file):
+            if not self._safe_index_note(md_file):  # V7: contained per-file
                 continue
             # Must match index_markdown_note's own formula exactly (same Path object).
             note_source_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(md_file)))

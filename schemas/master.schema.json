@@ -6,6 +6,36 @@
   "type": "object",
   "required": ["system", "header"],
   "additionalProperties": false,
+  "$defs": {
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(neuron|note|code|url|conv|text):"
+          },
+          "uniqueItems": true,
+          "description": "Prefixed provenance strings, CLI-sorted. Prefixes: neuron:|note:|code:|url:|conv:|text:. Never dereferenced at write time; warn-not-block on unresolvable neuron:/code: refs."
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Transaction time: when this claim entered the KB (distinct from validity time)."
+        },
+        "recorded_by": {
+          "type": "string",
+          "description": "User identity that recorded the claim (optional)."
+        },
+        "note": {
+          "type": "string",
+          "description": "Free-form annotation on this specific assertion (optional)."
+        }
+      }
+    }
+  },
   "properties": {
     "system": {
       "type": "object",
@@ -191,6 +221,9 @@
               "type": "string",
               "enum": ["confirmed", "rumored", "hypothetical", "alternative"],
               "description": "Epistemic certainty of this property"
+            },
+            "assertion": {
+              "$ref": "#/$defs/assertion"
             }
           }
         }
@@ -227,6 +260,24 @@
             },
             "uniqueItems": true,
             "description": "Tags for categorization"
+          },
+          "assertion": {
+            "$ref": "#/$defs/assertion"
+          },
+          "valid_from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO-8601 start of validity window for this link"
+          },
+          "valid_until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO-8601 end of validity window for this link"
+          },
+          "via_node_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "UUID of the reifying Why/How neuron for this edge"
           }
         }
       }

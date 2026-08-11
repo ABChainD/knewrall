@@ -13,12 +13,13 @@ import os
 import re
 import threading
 import uuid
+from datetime import datetime as _datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Union
 import logging
 from difflib import SequenceMatcher
 
-from jsonschema import validate, ValidationError
+from jsonschema import validate, ValidationError, Draft7Validator, FormatChecker, RefResolver
 from .knewrall_crud import (
     deterministic_json, generate_uuid, save_node, load_node, update_node,
     neuron_json_path, neuron_md_path,
@@ -33,6 +34,64 @@ from . import knewrall_fold_router as _fold_router
 # Make provider API keys (OPENROUTER_API_KEY, etc.) reachable regardless of the
 # invoking harness — the engine talks to the embedding provider on its own.
 load_dotenv_once()
+
+# jsonschema's built-in "date-time" format check is a silent no-op unless the
+# optional `rfc3339-validator` package is installed — and it isn't here, on
+# either machine. So a bare `validate(...)` treats `format: date-time` as
+# decoration and accepts `valid_from="banana"`. Register a dependency-free
+# RFC 3339 checker and validate THROUGH it, so the reification date fields
+# (recorded_at / valid_from / valid_until) are actually enforced as the resolved
+# open-question #3 requires — not left as the bare strings that answer rejected.
+_RFC3339_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$"
+)
+_FORMAT_CHECKER = FormatChecker()
+
+
+@_FORMAT_CHECKER.checks("date-time")
+def _is_rfc3339_datetime(value) -> bool:
+    # Non-strings are the `type` keyword's job, not the format checker's.
+    if not isinstance(value, str):
+        return True
+    # Shape first: requires a real time component + Z/offset, so a bare date
+    # ("2026-08-08") is rejected.
+    if not _RFC3339_DATETIME_RE.match(value):
+        return False
+    # Shape-only would accept impossible instants like 2026-13-45T99:99:99Z
+    # (N4). Parse it to reject out-of-range dates/times. Normalize Z→+00:00 and
+    # trim any over-long fractional part (the RE already vetted its shape) so a
+    # legitimate value still range-checks across Python versions.
+    probe = re.sub(r"(\.\d{6})\d+", r"\1", value.replace("Z", "+00:00").replace("z", "+00:00"))
+    try:
+        _datetime.fromisoformat(probe)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_node(instance: Dict) -> None:
+    """Schema-validate a node WITH format enforcement (see _FORMAT_CHECKER).
+    Raises jsonschema.ValidationError on failure, exactly like validate()."""
+    master_schema = load_schema(MASTER_SCHEMA_PATH)
+    Draft7Validator(master_schema, format_checker=_FORMAT_CHECKER).validate(instance)
+
+
+def _validate_link_obj(link_obj: Dict) -> None:
+    """Schema-validate a single link object against the master schema's
+    `links.items` subschema, WITH format enforcement. Raises ValidationError.
+
+    This is what actually guards the propose_link WRITE path: crud.update_node
+    performs no schema validation, so without this a malformed field on a link
+    (a non-UUID `via_node_id` (B1), an unknown assertion key or non-string date
+    or null certainty (B2)) is written straight to the neuron file — poisoning
+    it so every later update-node on that node is rejected. Validating the link
+    in isolation (rather than the whole merged node) means it doesn't depend on
+    the rest of the node already being schema-valid. A RefResolver rooted at the
+    full schema lets the subschema's `$ref: #/$defs/assertion` resolve."""
+    master_schema = load_schema(MASTER_SCHEMA_PATH)
+    link_schema = master_schema["properties"]["links"]["items"]
+    resolver = RefResolver.from_schema(master_schema)
+    Draft7Validator(link_schema, resolver=resolver, format_checker=_FORMAT_CHECKER).validate(link_obj)
 
 # Load schemas
 SCHEMAS_DIR = get_root() / "schemas"
@@ -390,13 +449,17 @@ def _truncate_text(value: Any, max_chars: int) -> Any:
 
 
 def _shape_neuron_for_recall(node: Dict, node_id: str, indexer: "KnewrallIndexer",
-                             max_description_chars: int) -> Dict:
+                             max_description_chars: int,
+                             include_assertions: bool = False) -> Dict:
     """Flatten a raw neuron dict into a compact, recall-friendly shape.
 
     Drops system noise (checksum/version), truncates long free-text
     descriptions, and resolves each link's target_id to a human-readable
     `name (type)` instead of a bare UUID — so the agent never has to make a
     second call just to know what a link points at.
+
+    Assertion blocks are elided by default (opt in via include_assertions)
+    to keep recall output within token budget.
     """
     header = node.get("header", {}) or {}
     descriptions = node.get("descriptions", {}) or {}
@@ -416,26 +479,84 @@ def _shape_neuron_for_recall(node: Dict, node_id: str, indexer: "KnewrallIndexer
     properties = node.get("properties", {}) or {}
     if properties:
         flat_properties = {}
+        property_assertions = {}
         for prop_key, entries in properties.items():
             if isinstance(entries, list) and entries:
                 flat_properties[prop_key] = entries[0].get("value")
+                # X6: property-value assertions were write-only — never surfaced
+                # by recall even with include_assertions. Surface them so provenance
+                # on a property is readable, symmetric with link assertions.
+                if include_assertions and entries[0].get("assertion"):
+                    property_assertions[prop_key] = entries[0]["assertion"]
         if flat_properties:
             shaped["properties"] = flat_properties
+        if property_assertions:
+            shaped["property_assertions"] = property_assertions
 
     links = node.get("links", []) or []
     resolved_links = []
+    supersession_links = []
     for link in links:
         target_id = link.get("target_id")
         target_row = indexer.get_node_by_id(target_id) if target_id else None
-        resolved_links.append({
-            "predicate": link.get("predicate"),
+        predicate = link.get("predicate")
+        if predicate in RESERVED_PREDICATES:
+            supersession_links.append({
+                "predicate": predicate,
+                "target_name": target_row["canonical_name"] if target_row else target_id,
+                "target_id": target_id,
+                "certainty": link.get("certainty"),
+            })
+            continue
+        resolved_link = {
+            "predicate": predicate,
             "direction": link.get("direction"),
             "target_name": target_row["canonical_name"] if target_row else target_id,
             "target_type": target_row["type"] if target_row else None,
             "target_id": target_id,
-        })
+        }
+        if include_assertions and link.get("assertion"):
+            resolved_link["assertion"] = link["assertion"]
+        if link.get("valid_from"):
+            resolved_link["valid_from"] = link["valid_from"]
+        if link.get("valid_until"):
+            resolved_link["valid_until"] = link["valid_until"]
+        resolved_links.append(resolved_link)
     if resolved_links:
         shaped["links"] = resolved_links
+    if supersession_links:
+        shaped["supersession"] = supersession_links
+
+    # Reverse view (N3 / spec §7.4): reserved predicates are outbound-only, so a
+    # claim that another neuron supersedes/contradicts/corroborates can only find
+    # out via the INBOUND edge. Query edges pointing at this node and surface them
+    # (relation phrased from this node's perspective) — otherwise a superseded
+    # claim could never show what replaced it.
+    _REVERSE_RELATION = {
+        "supersedes": "superseded_by",
+        "contradicts": "contradicted_by",
+        "corroborates": "corroborated_by",
+    }
+    reverse_claims = []
+    try:
+        inbound_edges = indexer.get_edges(target_id=node_id, link_type="node_link")
+        for edge in inbound_edges:
+            pred = edge.get("predicate")
+            if pred in RESERVED_PREDICATES:
+                src_id = edge.get("source_id")
+                src_row = indexer.get_node_by_id(src_id) if src_id else None
+                reverse_claims.append({
+                    "relation": _REVERSE_RELATION[pred],
+                    "source_name": src_row["canonical_name"] if src_row else src_id,
+                    "source_id": src_id,
+                    "certainty": edge.get("certainty"),
+                })
+    except Exception:
+        # Reverse view is best-effort enrichment; a missing/malformed edge index
+        # (or a mock indexer in tests) must never break the core recall shape.
+        reverse_claims = []
+    if reverse_claims:
+        shaped["reverse_claims"] = reverse_claims
 
     tags = node.get("tags", []) or []
     if tags:
@@ -447,7 +568,8 @@ def _shape_neuron_for_recall(node: Dict, node_id: str, indexer: "KnewrallIndexer
 def recall(terms: Union[str, List[str]], depth: int = 1, limit: int = 20,
           hybrid: bool = True, max_full: int = _RECALL_MAX_FULL,
           max_related_per_neuron: int = _RECALL_MAX_RELATED_PER_NEURON,
-          max_related_total: int = _RECALL_MAX_RELATED_TOTAL) -> Dict:
+          max_related_total: int = _RECALL_MAX_RELATED_TOTAL,
+          include_assertions: bool = False) -> Dict:
     """
     Consolidated retrieval for one or more keywords: a single call that finds,
     loads, and shapes the relevant neuron bodies (plus a bounded summary of
@@ -565,7 +687,8 @@ def recall(terms: Union[str, List[str]], depth: int = 1, limit: int = 20,
             # skip it rather than fail the whole recall call.
             logger.warning(f"recall: could not load neuron {node_id}, skipping: {e}")
             continue
-        matched.append(_shape_neuron_for_recall(node, node_id, indexer, _RECALL_MAX_DESCRIPTION_CHARS))
+        matched.append(_shape_neuron_for_recall(node, node_id, indexer, _RECALL_MAX_DESCRIPTION_CHARS,
+                                                include_assertions=include_assertions))
         matched_ids.add(node_id)
 
     # ── 5. Depth-1 related: capped summaries of matched neurons' links. ─────
@@ -678,14 +801,27 @@ def propose_node(payload: Dict) -> Tuple[bool, str, Optional[str]]:
     
     # Now validate with the generated ID
     try:
-        master_schema = load_schema(MASTER_SCHEMA_PATH)
-        validate(instance=payload, schema=master_schema)
+        _validate_node(payload)
     except ValidationError as e:
         logger.warning(f"Schema validation failed: {e}")
         return False, f"Schema validation error: {e.message}", None
     except Exception as e:
         logger.error(f"Unexpected validation error: {e}")
         return False, f"Validation error: {e}", None
+
+    # Hold inline links to the same reification rules propose_link enforces
+    # (reserved-predicate direction/certainty, assertion sources whitelist,
+    # warn-not-block). The JSON schema alone can't express these, so a node
+    # created with links[] would otherwise bypass them entirely (G1).
+    for link in payload.get("links", []):
+        rule_error = _validate_link_rules(link)
+        if rule_error:
+            return False, f"Invalid link ({link.get('predicate')!r} -> {link.get('target_id')!r}): {rule_error}", None
+
+    # Symmetry (B3): property-value assertions get the same checks a link's does.
+    prop_err = _validate_property_assertions(payload.get("properties"))
+    if prop_err:
+        return False, prop_err, None
 
     # Duplicate detection: fuzzy search on canonical_name and aliases
     header = payload.get("header", {})
@@ -777,6 +913,13 @@ def update_node_fields(node_id: str, updates: Dict, mode: str = "replace") -> Tu
         return False, "updates must not contain 'system' — id/version/last_updated are middleware-managed."
     if "links" in updates:
         return False, "update-node does not modify links; use propose-link instead."
+    # X8: reject unknown top-level keys instead of silently ignoring them while
+    # still reporting SUCCESS (a typo'd field would look applied but be dropped).
+    _UPDATABLE_FIELDS = {"header", "descriptions", "spatiotemporal", "tags", "properties"}
+    unknown = set(updates) - _UPDATABLE_FIELDS - {"system", "links"}
+    if unknown:
+        return False, (f"update-node does not support field(s): {sorted(unknown)}. "
+                       f"Updatable: {sorted(_UPDATABLE_FIELDS)}.")
 
     try:
         node = load_node(node_id)
@@ -787,14 +930,48 @@ def update_node_fields(node_id: str, updates: Dict, mode: str = "replace") -> Tu
 
     if "properties" in updates:
         props = dict(merged.get("properties", {}))
+        # Normalize the entries introduced by THIS update, keyed by property.
+        new_entries_by_key = {}
         for key, val in updates["properties"].items():
             entries = val if isinstance(val, list) else [val]
             entries = [e if isinstance(e, dict) else {"value": e} for e in entries]
+            new_entries_by_key[key] = entries
+        # X1: hold property-value assertions to the same source-prefix / neuron-UUID
+        # checks propose_node applies (update-node used to skip this entirely). But
+        # validate ONLY the entries this call introduces, never the whole merged
+        # block (Y2): a pre-existing bad legacy assertion on an untouched property
+        # must not brick an unrelated update (tags, header, ...). Sorting sources
+        # here — before the append dedup below — also makes --append idempotent
+        # (Y3: a reordered payload no longer appends a byte-identical duplicate).
+        prop_err = _validate_property_assertions(new_entries_by_key)
+        if prop_err:
+            return False, prop_err
+        for key, entries in new_entries_by_key.items():
             if mode == "append" and key in props:
                 existing = list(props[key])
+                # W2: dedup by the CANONICAL (recursively deterministic) form, not
+                # raw `e not in existing`. On save, crud._deterministic_sort
+                # normalizes nested lists/dicts, so two entries differing only in
+                # nested ordering are identical on disk — a raw comparison would
+                # still append a byte-identical duplicate. Sorting only
+                # `assertion.sources` (Y3) covered one field; this covers the class.
+                def _canon(x):
+                    # V2: some values can't be canonicalized (e.g. a nested list of
+                    # mixed types _deterministic_sort can't sort). Never let that
+                    # raise a raw traceback out of --append — return None so the
+                    # entry skips dedup and _validate_node below rejects it with a
+                    # clean (False, msg), matching replace-mode and propose-node.
+                    try:
+                        return deterministic_json(x)
+                    except Exception:
+                        return None
+                existing_canon = {c for c in (_canon(x) for x in existing) if c is not None}
                 for e in entries:
-                    if e not in existing:
+                    c = _canon(e)
+                    if c is None or c not in existing_canon:
                         existing.append(e)
+                        if c is not None:
+                            existing_canon.add(c)
                 props[key] = existing
             else:
                 props[key] = entries
@@ -810,8 +987,7 @@ def update_node_fields(node_id: str, updates: Dict, mode: str = "replace") -> Tu
         merged["tags"] = updates["tags"]
 
     try:
-        master_schema = load_schema(MASTER_SCHEMA_PATH)
-        validate(instance=merged, schema=master_schema)
+        _validate_node(merged)
     except ValidationError as e:
         return False, f"Schema validation error: {e.message}"
 
@@ -832,9 +1008,170 @@ def update_node_fields(node_id: str, updates: Dict, mode: str = "replace") -> Tu
 
     return True, f"Node {node_id} updated ({mode} mode)."
 
+RESERVED_PREDICATES = {"supersedes", "contradicts", "corroborates"}
+VALID_SOURCE_PREFIXES = ("neuron:", "note:", "code:", "url:", "conv:", "text:")
+VALID_CERTAINTY = ("confirmed", "rumored", "hypothetical", "alternative")
+VALID_DIRECTIONS = ("outbound", "inbound", "bidirectional")
+
+
+def _validate_assertion_block(assertion: Dict, node_id_for_warn: Optional[str] = None) -> Optional[str]:
+    """Validate an assertion block's sources prefix whitelist and warn-not-block
+    on unresolvable neuron:/code: refs. Returns a blocking-error string, or None."""
+    # X4: a non-dict assertion (e.g. a bare string passed programmatically) must
+    # be a clean rejection, not an AttributeError from .get() below.
+    if not isinstance(assertion, dict):
+        return "assertion must be an object"
+    sources = assertion.get("sources", [])
+    if not isinstance(sources, list):
+        return "assertion.sources must be a list"
+    for src in sources:
+        if not isinstance(src, str) or not src.startswith(VALID_SOURCE_PREFIXES):
+            return f"source {src!r} does not match a valid prefix: {VALID_SOURCE_PREFIXES}"
+        if src.startswith("neuron:"):
+            ref_id = src[len("neuron:"):]
+            try:
+                uuid.UUID(ref_id)
+            except ValueError:
+                return f"neuron: source has invalid UUID: {ref_id!r}"
+            try:
+                load_node(ref_id)
+            except FileNotFoundError:
+                logger.warning(f"assertion source {src!r} references non-existent neuron (warn-not-block)")
+        elif src.startswith("code:"):
+            # X2: the codegraph DB (codegraph.db) is per-machine and .stignore'd,
+            # so on any root where `index-code` never ran the table doesn't exist.
+            # That must stay warn-not-block (as documented), not crash the write
+            # with an unhandled sqlite OperationalError.
+            try:
+                cg = get_codegraph()
+                sym = cg.get_symbol(src[len("code:"):])
+            except Exception as e:
+                logger.warning(f"assertion source {src!r} could not be resolved against codegraph.db "
+                               f"({e}); warn-not-block")
+                sym = None
+            if sym is None:
+                logger.warning(f"assertion source {src!r} not found in codegraph.db (warn-not-block)")
+    return None
+
+
+def _validate_property_assertions(properties: Optional[Dict]) -> Optional[str]:
+    """Validate (and deterministically sort the sources of) every assertion block
+    attached to a property value. Returns a blocking-error string, or None.
+
+    Shared by propose_node and update_node_fields so both hold property-value
+    assertions to the same source-prefix / neuron-UUID checks a link assertion
+    gets — the JSON schema only vets the source *prefix*, not the UUID after
+    `neuron:` (B3/X1). update_node_fields previously skipped this entirely."""
+    for prop_key, entries in (properties or {}).items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            prop_assertion = entry.get("assertion") if isinstance(entry, dict) else None
+            if prop_assertion:
+                warn = _validate_assertion_block(prop_assertion)
+                if warn:
+                    return f"Invalid assertion on property {prop_key!r}: {warn}"
+                if isinstance(prop_assertion, dict) and prop_assertion.get("sources"):
+                    prop_assertion["sources"] = sorted(prop_assertion["sources"])
+    return None
+
+
+def _validate_via_node_id(via_id: Optional[str]) -> Optional[str]:
+    """Block on a non-string via_node_id; warn-not-block if it references a
+    non-existent neuron. Returns a blocking-error string, or None."""
+    if via_id is None:
+        return None
+    # W3: a truthy non-string via_node_id (int, dict, ...) used to crash with an
+    # AttributeError from deep inside load_node instead of being rejected. Guard
+    # the type here (the X4 class, one field over).
+    if not isinstance(via_id, str):
+        return f"via_node_id must be a string UUID, got {type(via_id).__name__}"
+    # V5: an empty or non-UUID string used to slip through here (existence-only
+    # check) and then get silently dropped by build_link_obj's `if via_node_id:`,
+    # so propose_link returned SUCCESS having written nothing — while the inline
+    # node path rejected it. Validate the UUID format at the rule layer so both
+    # paths agree.
+    try:
+        uuid.UUID(via_id)
+    except ValueError:
+        return f"via_node_id is not a valid UUID: {via_id!r}"
+    try:
+        load_node(via_id)
+    except FileNotFoundError:
+        logger.warning(f"via_node_id {via_id!r} references non-existent neuron (warn-not-block)")
+    return None
+
+
+def _validate_link_rules(link: Dict) -> Optional[str]:
+    """Enforce the reification link rules on a single link dict, and normalize it
+    (sort assertion.sources for deterministic output). Returns a blocking error
+    string, or None if the link is acceptable. Warn-not-block conditions
+    (unresolvable sources / via_node_id) log and pass.
+
+    This is the AUTHORITATIVE link validator, shared by propose_link and
+    propose_node. It must not rely on downstream schema validation: the
+    propose_link write path (crud.update_node) does NOT re-validate against the
+    schema, so date/certainty enforcement that lived only in the JSON schema was
+    silently skipped there — invalid `valid_from`/`recorded_at`/`certainty` got
+    written to disk (N1). So those checks are duplicated here, at the choke point
+    both paths pass through."""
+    predicate = link.get("predicate")
+    # V3: a non-string predicate (list/dict) is unhashable — `predicate in
+    # RESERVED_PREDICATES` (a set) would raise TypeError. Reject the type first.
+    if not isinstance(predicate, str) or not predicate:
+        return f"predicate must be a non-empty string, got {predicate!r}"
+    if predicate in RESERVED_PREDICATES:
+        if link.get("direction") != "outbound":
+            return f"Reserved predicate {predicate!r} requires direction='outbound'"
+        if not link.get("certainty"):
+            return f"Reserved predicate {predicate!r} requires certainty"
+    # W4: an out-of-enum direction used to fall through the outbound/inbound/
+    # bidirectional dispatch and write NOTHING while returning success. Validate
+    # the enum here (symmetric with certainty) so it's a clean rejection.
+    direction = link.get("direction")
+    if direction is not None and direction not in VALID_DIRECTIONS:
+        return f"direction {direction!r} not one of {VALID_DIRECTIONS}"
+    certainty = link.get("certainty")
+    if certainty is not None and certainty not in VALID_CERTAINTY:
+        return f"certainty {certainty!r} not one of {VALID_CERTAINTY}"
+    for field in ("valid_from", "valid_until"):
+        val = link.get(field)
+        # V8: require a present value to be a STRING that is valid RFC 3339.
+        # _is_rfc3339_datetime returns True for non-strings (it defers those to
+        # the schema's type keyword), so a falsy non-string like [] or {} slipped
+        # this check and was then silently dropped by build_link_obj's truthiness
+        # test — success with the bad value gone (the Y1/V5 class, on the date
+        # fields). Reject any non-None value that isn't a valid RFC 3339 string.
+        if val is not None and not (isinstance(val, str) and _is_rfc3339_datetime(val)):
+            return f"{field} {val!r} is not an RFC 3339 date-time (e.g. 2026-08-08T10:00:00Z)"
+    assertion = link.get("assertion")
+    # Y1: `if assertion:` let FALSY non-dicts (0, '', False, []) slip through —
+    # propose_link then silently dropped the provenance and returned SUCCESS,
+    # while the node paths rejected the same value. Check `is not None` so any
+    # present-but-non-dict assertion is rejected by _validate_assertion_block.
+    if assertion is not None:
+        warn = _validate_assertion_block(assertion)
+        if warn:
+            return f"Invalid assertion: {warn}"
+        recorded_at = assertion.get("recorded_at")
+        if recorded_at is not None and not _is_rfc3339_datetime(recorded_at):
+            return f"assertion.recorded_at {recorded_at!r} is not an RFC 3339 date-time"
+        if assertion.get("sources"):
+            assertion["sources"] = sorted(assertion["sources"])
+    if link.get("via_node_id") is not None:
+        via_err = _validate_via_node_id(link["via_node_id"])
+        if via_err:
+            return via_err
+    return None
+
+
 def propose_link(source_id: str, target_id: str, relationship_type: str,
                  direction: str = "outbound", certainty: str = "confirmed", 
-                 tags: Optional[List[str]] = None) -> Tuple[bool, str]:
+                 tags: Optional[List[str]] = None,
+                 assertion: Optional[Dict] = None,
+                 valid_from: Optional[str] = None,
+                 valid_until: Optional[str] = None,
+                 via_node_id: Optional[str] = None) -> Tuple[bool, str]:
     """
     Updates the respective JSON files' `links` arrays.
     Must validate that both nodes exist. For bidirectional links, updates both nodes.
@@ -846,17 +1183,36 @@ def propose_link(source_id: str, target_id: str, relationship_type: str,
         direction: "outbound", "inbound", or "bidirectional".
         certainty: "confirmed", "rumored", "hypothetical", "alternative".
         tags: Optional list of tags for the link.
+        assertion: Optional assertion block (sources, recorded_at, recorded_by, note).
+        valid_from: Optional ISO-8601 start of validity window.
+        valid_until: Optional ISO-8601 end of validity window.
+        via_node_id: Optional UUID of reifying Why/How neuron.
 
     Returns:
         (success: bool, message: str)
     """
-    # Validate UUID format (basic)
+    # Validate UUID format (basic). V3: a NON-string source_id/target_id makes
+    # uuid.UUID() raise TypeError/AttributeError, not ValueError — widen the
+    # catch so a non-string id rejects cleanly instead of crashing out of
+    # propose_link, matching propose_node's inline path.
     for uid, label in [(source_id, "source_id"), (target_id, "target_id")]:
         try:
             uuid.UUID(uid)
-        except ValueError:
-            return False, f"{label} is not a valid UUID: {uid}"
+        except (ValueError, TypeError, AttributeError):
+            return False, f"{label} is not a valid UUID: {uid!r}"
     
+    rule_error = _validate_link_rules({
+        "predicate": relationship_type,
+        "direction": direction,
+        "certainty": certainty,
+        "assertion": assertion,
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "via_node_id": via_node_id,
+    })
+    if rule_error:
+        return False, rule_error
+
     # Load both nodes to ensure existence
     try:
         source_node = load_node(source_id)
@@ -868,16 +1224,7 @@ def propose_link(source_id: str, target_id: str, relationship_type: str,
     
     tags = tags or []
 
-    # Reject if this link already exists on the source node
-    for existing_link in source_node.get("links", []):
-        if (existing_link.get("target_id") == target_id and
-                existing_link.get("predicate") == relationship_type):
-            return False, (
-                f"Link already exists between {source_id} and {target_id} "
-                f"with predicate '{relationship_type}'"
-            )
-
-    def add_link_to_node(node_id: str, t_id: str, pred: str, dir: str, cert: str, tgs: List[str]):
+    def build_link_obj(t_id: str, pred: str, dir: str, cert: str, tgs: List[str]) -> Dict:
         link_obj = {
             "target_id": t_id,
             "predicate": pred,
@@ -885,18 +1232,64 @@ def propose_link(source_id: str, target_id: str, relationship_type: str,
             "certainty": cert,
             "tags": tgs
         }
-        update_node(node_id, {"links": [link_obj]})
+        if assertion:
+            link_obj["assertion"] = assertion
+        if valid_from:
+            link_obj["valid_from"] = valid_from
+        if valid_until:
+            link_obj["valid_until"] = valid_until
+        if via_node_id:
+            link_obj["via_node_id"] = via_node_id
+        return link_obj
+
+    # Build the write plan: (node_id, link to append, the node's current state).
+    writes = []
+    if direction in ["outbound", "bidirectional"]:
+        writes.append((source_id, build_link_obj(target_id, relationship_type, direction, certainty, tags), source_node))
+    # Reverse link on the target for inbound/bidirectional.
+    # "inbound" from source's perspective → "outbound" from target's perspective.
+    if direction in ["inbound", "bidirectional"]:
+        target_dir = "outbound" if direction == "inbound" else "bidirectional"
+        writes.append((target_id, build_link_obj(source_id, relationship_type, target_dir, certainty, tags), target_node))
+
+    # W4 backstop: _validate_link_rules already rejects an out-of-enum direction,
+    # but never report success having written nothing — if the plan is empty the
+    # direction dispatch above matched neither branch.
+    if not writes:
+        return False, f"No link written: unrecognized direction {direction!r}"
+
+    # Reject a duplicate (owner, target, predicate) on EACH node that will receive
+    # a link — not just the source (X3). The edges index PK is
+    # (source_id, target_id, predicate, link_type), so a second such edge with
+    # different metadata would append to the file but collapse to one index row,
+    # silently dropping the first's provenance. This is now reachable because an
+    # inbound/bidirectional write lands on the target, which the old source-only
+    # check never guarded.
+    for node_id, link_obj, current in writes:
+        for existing_link in current.get("links", []):
+            if (existing_link.get("target_id") == link_obj["target_id"] and
+                    existing_link.get("predicate") == link_obj["predicate"]):
+                return False, (
+                    f"Link already exists on {node_id} to {link_obj['target_id']} "
+                    f"with predicate '{link_obj['predicate']}'"
+                )
+
+    # Schema-validate each link object BEFORE writing. crud.update_node performs
+    # no schema validation, so this is the only thing standing between a malformed
+    # field and a poisoned neuron file that then fails EVERY later update-node on
+    # it. _validate_link_rules above covers the reserved-predicate semantics the
+    # schema can't express; this closes everything the schema *can* — non-UUID
+    # via_node_id (B1), unknown assertion keys / non-string dates / null certainty
+    # (B2), etc.
+    for node_id, link_obj, current in writes:
+        try:
+            _validate_link_obj(link_obj)
+        except ValidationError as e:
+            return False, f"Schema validation error: {e.message}"
 
     try:
-        # Add link to source node
-        if direction in ["outbound", "bidirectional"]:
-            add_link_to_node(source_id, target_id, relationship_type, direction, certainty, tags)
-
-        # Add reverse link to target node for inbound/bidirectional.
-        # "inbound" from source's perspective → "outbound" from target's perspective.
-        if direction in ["inbound", "bidirectional"]:
-            target_dir = "outbound" if direction == "inbound" else "bidirectional"
-            add_link_to_node(target_id, source_id, relationship_type, target_dir, certainty, tags)
+        for node_id, link_obj, _current in writes:
+            update_node(node_id, {"links": [link_obj]})
     except Exception as e:
         return False, f"Failed to update node: {e}"
 
@@ -1277,9 +1670,15 @@ def link_code(neuron_id: str, symbol_id: str, repo: str,
     except FileNotFoundError:
         return False, f"Neuron not found: {neuron_id}"
 
-    # Warn if symbol not in code graph
-    cg = get_codegraph()
-    sym = cg.get_symbol(symbol_id)
+    # Warn if symbol not in code graph. X2: guard the lookup — codegraph.db is
+    # per-machine/.stignore'd, so on a root where `index-code` never ran the
+    # table is absent; that must warn, not crash the write.
+    try:
+        cg = get_codegraph()
+        sym = cg.get_symbol(symbol_id)
+    except Exception as e:
+        logger.warning(f"link_code: codegraph lookup failed ({e}); warn-not-block")
+        sym = None
     warning = ""
     if sym is None:
         warning = (
@@ -1288,13 +1687,22 @@ def link_code(neuron_id: str, symbol_id: str, repo: str,
         )
 
     new_ref = {"symbol_id": symbol_id, "repo": repo, "kind": kind}
-    existing = node.get("code_refs", [])
+    existing = list(node.get("code_refs", []))
 
     # Dedup by symbol_id
     if any(r.get("symbol_id") == symbol_id for r in existing):
         return True, f"code_ref already present on neuron {neuron_id}.{warning}"
 
     existing.append(new_ref)
+    # X7: crud.update_node does no schema validation, so validate the resulting
+    # node before writing — a bad code_ref (e.g. an out-of-enum `kind`) would
+    # otherwise poison the neuron file and break every later update-node on it.
+    prospective = dict(node)
+    prospective["code_refs"] = existing
+    try:
+        _validate_node(prospective)
+    except ValidationError as e:
+        return False, f"Schema validation error: {e.message}"
     update_node(neuron_id, {"code_refs": existing})
 
     # Re-index so the neuron's new state is visible

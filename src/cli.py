@@ -103,6 +103,8 @@ def main():
                                help="Output encoding (default toon)")
     recall_parser.add_argument("--no-hybrid", action="store_false", dest="hybrid", default=True,
                                help="Disable semantic vector search; literal match only")
+    recall_parser.add_argument("--include-assertions", action="store_true", default=False,
+                               help="Include assertion blocks (sources, recorded_at, etc.) in output")
 
     # ── Code graph commands ───────────────────────────────────────────────────
 
@@ -202,6 +204,26 @@ def main():
     propose_link_parser.add_argument("source_id", help="UUID of source node")
     propose_link_parser.add_argument("target_id", help="UUID of target node")
     propose_link_parser.add_argument("predicate", help="Relationship type (e.g., knows, part_of)")
+    propose_link_parser.add_argument("--direction", default="outbound",
+                                     choices=["outbound", "inbound", "bidirectional"],
+                                     help="Link direction (default: outbound)")
+    propose_link_parser.add_argument("--certainty", default="confirmed",
+                                     choices=["confirmed", "rumored", "hypothetical", "alternative"],
+                                     help="Certainty level (default: confirmed)")
+    propose_link_parser.add_argument("--valid-from", default=None, dest="valid_from",
+                                     help="ISO-8601 start of validity window")
+    propose_link_parser.add_argument("--valid-until", default=None, dest="valid_until",
+                                     help="ISO-8601 end of validity window")
+    propose_link_parser.add_argument("--via-node-id", default=None, dest="via_node_id",
+                                     help="UUID of reifying Why/How neuron")
+    propose_link_parser.add_argument("--source-ref", action="append", default=None, dest="source_refs",
+                                     help="Prefixed provenance source (e.g. 'note:path/to/note.md'). Repeatable.")
+    propose_link_parser.add_argument("--recorded-at", default=None, dest="recorded_at",
+                                     help="ISO-8601 transaction time for this claim")
+    propose_link_parser.add_argument("--recorded-by", default=None, dest="recorded_by",
+                                     help="User identity that recorded this claim")
+    propose_link_parser.add_argument("--note", default=None, dest="assertion_note",
+                                     help="Free-form annotation on this specific claim")
 
     # update-note-links command
     update_note_parser = subparsers.add_parser("update-note-links", help="Append wikilinks to a markdown note")
@@ -347,7 +369,8 @@ def main():
             for r in results:
                 print(f"{r['id']} | {r['type']} | {r['canonical_name']} | aliases: {r['aliases']}")
     elif args.command == "recall":
-        result = recall(args.terms, depth=args.depth, limit=args.limit, hybrid=args.hybrid)
+        result = recall(args.terms, depth=args.depth, limit=args.limit, hybrid=args.hybrid,
+                        include_assertions=args.include_assertions)
         if args.format == "json":
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
@@ -413,7 +436,23 @@ def main():
             print(f"FAILURE: {msg}", file=sys.stderr)
             sys.exit(1)
     elif args.command == "propose-link":
-        success, msg = propose_link(args.source_id, args.target_id, args.predicate)
+        assertion = None
+        if args.source_refs or args.recorded_at or args.recorded_by or args.assertion_note:
+            assertion = {}
+            if args.source_refs:
+                assertion["sources"] = sorted(args.source_refs)
+            if args.recorded_at:
+                assertion["recorded_at"] = args.recorded_at
+            if args.recorded_by:
+                assertion["recorded_by"] = args.recorded_by
+            if args.assertion_note:
+                assertion["note"] = args.assertion_note
+        success, msg = propose_link(args.source_id, args.target_id, args.predicate,
+                                    direction=args.direction, certainty=args.certainty,
+                                    assertion=assertion,
+                                    valid_from=args.valid_from,
+                                    valid_until=args.valid_until,
+                                    via_node_id=args.via_node_id)
         if success:
             print(f"SUCCESS: {msg}")
         else:
