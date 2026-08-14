@@ -246,6 +246,10 @@ def main():
     fold_parser.add_argument("--file", default=None, help="Fold this file instead of reading stdin")
     fold_parser.add_argument("--quiet", action="store_true", help="Print only the retrieval key")
     fold_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+    fold_parser.add_argument("--ask", default=None, dest="question")
+    fold_parser.add_argument("--provider", default=None)
+    fold_parser.add_argument("--no-assistant", action="store_true")
+    fold_parser.add_argument("--ask-strict", action="store_true")
 
     # fold-run — run a command, fold its full output, print head+tail+digest+marker
     fold_run_parser = subparsers.add_parser(
@@ -257,6 +261,10 @@ def main():
     fold_run_parser.add_argument("--keep-tail", type=int, default=None, dest="keep_tail")
     fold_run_parser.add_argument("--quiet", action="store_true")
     fold_run_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+    fold_run_parser.add_argument("--ask", default=None, dest="question")
+    fold_run_parser.add_argument("--provider", default=None)
+    fold_run_parser.add_argument("--no-assistant", action="store_true")
+    fold_run_parser.add_argument("--ask-strict", action="store_true")
     # dest="cmd_args" (NOT "command") — a positional named "command" here would
     # clobber the top-level subparsers' dest="command" in the shared Namespace,
     # since argparse merges all parsed args into one Namespace object.
@@ -601,13 +609,27 @@ def main():
         if args.file is None:
             content = sys.stdin.read()
         result = fold(content=content, file=args.file, label=args.label, kind=args.kind,
-                      session_id=args.session_id, quiet=args.quiet)
+                      session_id=args.session_id, quiet=args.quiet, ask=args.question,
+                      provider=args.provider, no_assistant=args.no_assistant,
+                      ask_strict=args.ask_strict)
         if result.get("passthrough"):
             sys.stdout.write(result["content"])
             if result.get("warning"):
                 print(result["warning"], file=sys.stderr)
+            if result.get("assistant_hint"):
+                print(result["assistant_hint"], file=sys.stderr)
+            if result.get("assistant_error"):
+                print(f"assistant_error: {result['assistant_error']}", file=sys.stderr)
+                if args.ask_strict and result["assistant_error"] != "below_threshold":
+                    sys.exit(3)
         else:
             print(result["marker"])
+            if result.get("assistant"):
+                print(json.dumps({"assistant": result["assistant"]}, ensure_ascii=False, indent=2))
+            if result.get("assistant_error"):
+                print(f"assistant_error: {result['assistant_error']}", file=sys.stderr)
+                if args.ask_strict and result["assistant_error"] != "below_threshold":
+                    sys.exit(3)
 
     elif args.command == "fold-run":
         command = args.cmd_args
@@ -619,8 +641,18 @@ def main():
             sys.exit(2)
         result = fold_run(command, label=args.label, kind=args.kind,
                           keep_head=args.keep_head, keep_tail=args.keep_tail,
-                          session_id=args.session_id, quiet=args.quiet)
+                          session_id=args.session_id, quiet=args.quiet, ask=args.question,
+                          provider=args.provider, no_assistant=args.no_assistant,
+                          ask_strict=args.ask_strict)
         print(result["output"])
+        if result.get("assistant"):
+            print(json.dumps({"assistant": result["assistant"]}, ensure_ascii=False, indent=2))
+        if result.get("assistant_hint"):
+            print(result["assistant_hint"], file=sys.stderr)
+        if result.get("assistant_error"):
+            print(f"assistant_error: {result['assistant_error']}", file=sys.stderr)
+            if args.ask_strict and result["assistant_error"] != "below_threshold":
+                sys.exit(3)
         sys.exit(result["exit_code"])
 
     elif args.command == "unfold":

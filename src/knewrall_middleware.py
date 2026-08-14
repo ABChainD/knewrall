@@ -1961,6 +1961,10 @@ def fold(
     kind: Optional[str] = None,
     session_id: Optional[str] = None,
     quiet: bool = False,
+    ask: Optional[str] = None,
+    ask_strict: bool = False,
+    no_assistant: bool = False,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fold content the agent already has (stdin) or a file it's about to
     read into an engram, returning a compact retrieval marker instead of the
@@ -1979,15 +1983,64 @@ def fold(
             with open(file, "rb") as f:
                 payload_bytes = f.read()
         except OSError as e:
-            return {"passthrough": True, "content": "", "warning": f"cannot read {file}: {e}"}
+            result = {"passthrough": True, "content": "", "warning": f"cannot read {file}: {e}", "assistant_error": "not_folded"}
+            return _apply_fold_assistant(result, "", ask=ask, ask_strict=ask_strict,
+                                         no_assistant=no_assistant, provider=provider, root=root)
         source = {"tool": "Read", "cmd": None, "path": str(Path(file).resolve()), "cwd": os.getcwd()}
     else:
         payload_bytes = (content or "").encode("utf-8")
         source = {"tool": "stdin", "cmd": None, "path": None, "cwd": os.getcwd()}
 
-    return _fold_payload(
+    result = _fold_payload(
         payload_bytes, source, label=label, kind=kind, session_id=session_id, root=root, quiet=quiet,
     )
+    return _apply_fold_assistant(result, payload_bytes.decode("utf-8", errors="replace"), ask=ask,
+                                 ask_strict=ask_strict, no_assistant=no_assistant, provider=provider,
+                                 root=root)
+
+
+def _apply_fold_assistant(result: Dict[str, Any], text: str, *, ask: Optional[str],
+                          ask_strict: bool, no_assistant: bool, provider: Optional[str],
+                          root: Path) -> Dict[str, Any]:
+    cfg = _assistant_config()
+    if ask is None:
+        if (not result.get("passthrough") and not no_assistant and cfg.get("enabled", False)
+                and cfg.get("hint_on_threshold", True) and len(text) >= int(cfg.get("min_chars", 20000))):
+            result["assistant_hint"] = "content exceeds assistant.min_chars; use --ask to query it"
+        return result
+    if no_assistant:
+        return result
+    if result.get("passthrough"):
+        result["assistant"] = None
+        result["assistant_error"] = result.get("assistant_error") or ("not_folded" if result.get("warning") else "below_threshold")
+        return result
+    if not cfg.get("enabled", False):
+        result["assistant"] = None
+        result["assistant_error"] = "disabled"
+        return result
+    if len(text) < int(cfg.get("min_chars", 20000)):
+        result["assistant"] = None
+        result["assistant_error"] = "below_threshold"
+        return result
+    rr = _reader.ask(text, ask, config={"assistant": cfg}, kind=result.get("meta", {}).get("kind", "prose"), provider=provider)
+    if rr.error:
+        result["assistant"] = None
+        result["assistant_error"] = rr.error
+        if rr.detail:
+            print(f"assistant provider failure: {rr.detail}", file=sys.stderr)
+        return result
+    result["assistant"] = _assistant_result(rr)
+    key = result.get("key")
+    if key:
+        session = _engrams.resolve_session(root=root, touch=False)
+        meta = result.get("meta", {})
+        answers = dict(meta.get("assistant_answers") or {})
+        answers[_reader._question_hash(ask)] = {**result["assistant"], "question": ask, "created_at": _engrams._iso(_engrams._now())}
+        keywords = list(dict.fromkeys((meta.get("assistant_keywords") or []) + rr.keywords))[:24]
+        _engrams.update_engram_state(key, session=session, root=root, assistant_answers=answers, assistant_keywords=keywords)
+        meta["assistant_answers"] = answers
+        meta["assistant_keywords"] = keywords
+    return result
 
 
 def unfold(
@@ -2258,6 +2311,10 @@ def fold_run(
     keep_tail: Optional[int] = None,
     session_id: Optional[str] = None,
     quiet: bool = False,
+    ask: Optional[str] = None,
+    ask_strict: bool = False,
+    no_assistant: bool = False,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run `command`, fold its full (stdout+stderr, combined) output as an
     engram, and return head + tail + a type-aware digest + a retrieval
@@ -2281,11 +2338,15 @@ def fold_run(
     cfg = _engrams_config()
     display_cmd = " ".join(command)
 
+    def finish_passthrough(output: str, code: int, error: Optional[str] = None) -> Dict[str, Any]:
+        value = {"exit_code": code, "passthrough": True, "output": output}
+        if error:
+            value["assistant_error"] = error
+        return _apply_fold_assistant(value, "", ask=ask, ask_strict=ask_strict,
+                                     no_assistant=no_assistant, provider=provider, root=root)
+
     if _is_knewrall_invocation(display_cmd):
-        return {
-            "exit_code": 1, "passthrough": True,
-            "output": f"$ {display_cmd}\n[refused: fold-run does not wrap Knewrall's own CLI]",
-        }
+        return finish_passthrough(f"$ {display_cmd}\n[refused: fold-run does not wrap Knewrall's own CLI]", 1, "not_folded")
 
     with tempfile.NamedTemporaryFile(mode="w+b", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -2294,7 +2355,7 @@ def fold_run(
             exit_code = proc.returncode
         except OSError as e:
             tmp_path.unlink(missing_ok=True)
-            return {"exit_code": 127, "passthrough": True, "output": f"$ {display_cmd}\n[error: {e}]"}
+            return finish_passthrough(f"$ {display_cmd}\n[error: {e}]", 127, "not_folded")
 
     try:
         payload_bytes = tmp_path.read_bytes()
@@ -2306,7 +2367,10 @@ def fold_run(
 
     if len(payload_bytes) < cfg["min_fold_bytes"] and num_lines < cfg["min_fold_lines"]:
         # Rule 1: size floor — the command already ran; nothing to fold.
-        return {"exit_code": exit_code, "passthrough": True, "output": f"$ {display_cmd}\n{text}"}
+        return _apply_fold_assistant(
+            {"exit_code": exit_code, "passthrough": True, "output": f"$ {display_cmd}\n{text}", "assistant_error": "below_threshold"},
+            text, ask=ask, ask_strict=ask_strict, no_assistant=no_assistant, provider=provider, root=root,
+        )
 
     source = {"tool": "Bash", "cmd": display_cmd, "path": None, "cwd": os.getcwd()}
     detected_kind, digest, keywords = _fold_router.classify_and_digest(
@@ -2331,10 +2395,7 @@ def fold_run(
             ttl_hours=cfg["ttl_hours"], max_session_bytes=cfg["max_session_bytes"],
         )
     except _engrams.EngramStoreFull as e:
-        return {
-            "exit_code": exit_code, "passthrough": True,
-            "output": f"$ {display_cmd}\n{text}\n[fold refused: {e}]",
-        }
+        return finish_passthrough(f"$ {display_cmd}\n{text}\n[fold refused: {e}]", exit_code, "not_folded")
 
     header = _engrams.read_meta(key, session=session, root=root)
     _engrams.record_adaptive_fold(root, detected_kind, display_cmd)
@@ -2368,10 +2429,12 @@ def fold_run(
             transcript.append(tail_block)
         transcript.append(f"retrieve: python knewrall/bin/knewrall.py unfold {key} [--grep PATTERN] [--lines A-B]")
 
-    return {
+    result = {
         "exit_code": exit_code, "passthrough": False,
         "output": "\n".join(transcript), "key": key, "meta": header,
     }
+    return _apply_fold_assistant(result, text, ask=ask, ask_strict=ask_strict,
+                                 no_assistant=no_assistant, provider=provider, root=root)
 
 
 def _fmt_bytes(n: int) -> str:
