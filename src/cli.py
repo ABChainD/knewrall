@@ -45,6 +45,7 @@ from .knewrall_middleware import (
 )
 from .knewrall_toon import encode as encode_toon
 from .knewrall_reader_router import detect
+from .knewrall_reader import ask as reader_ask, stats as reader_stats, cache_gc
 
 
 def _parse_duration_hours(text: str) -> float:
@@ -320,6 +321,17 @@ def main():
 
     probe_parser = subparsers.add_parser("reader-probe", help="Show configured ARL provider availability")
     probe_parser.add_argument("--refresh", action="store_true")
+
+    reader_parser = subparsers.add_parser("reader-ask", help="Answer a question against a text file or stdin")
+    reader_parser.add_argument("--file", default=None)
+    reader_parser.add_argument("--ask", required=True, dest="question")
+    reader_parser.add_argument("--provider", default=None)
+    reader_parser.add_argument("--no-assistant", action="store_true")
+    reader_parser.add_argument("--ask-strict", action="store_true")
+    subparsers.add_parser("reader-stats", help="Show ARL invocation and cache statistics")
+    gc_parser = subparsers.add_parser("reader-cache-gc", help="Remove expired ARL cache rows")
+    gc_parser.add_argument("--older-than", default=None)
+    gc_parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
 
@@ -697,6 +709,24 @@ def main():
         for name, status in detect(refresh=args.refresh).items():
             suffix = f" ({status.resolved})" if status.resolved else ""
             print(f"{name}: {'available' if status.available else 'unavailable'} - {status.reason}{suffix}")
+
+    elif args.command == "reader-ask":
+        try:
+            text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+        except OSError as exc:
+            print(f"Error reading input: {exc}", file=sys.stderr)
+            sys.exit(1)
+        result = reader_ask(text, args.question, provider=args.provider, no_assistant=args.no_assistant)
+        print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
+        if args.ask_strict and result.error:
+            sys.exit(3)
+
+    elif args.command == "reader-stats":
+        print(json.dumps(reader_stats(), ensure_ascii=False, indent=2))
+
+    elif args.command == "reader-cache-gc":
+        older = _parse_duration_hours(args.older_than) if args.older_than else None
+        print(json.dumps(cache_gc(older_than_hours=older, dry_run=args.dry_run), indent=2))
 
     else:
         parser.print_help()
