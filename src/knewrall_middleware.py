@@ -571,7 +571,9 @@ def recall(terms: Union[str, List[str]], depth: int = 1, limit: int = 20,
           hybrid: bool = True, max_full: int = _RECALL_MAX_FULL,
           max_related_per_neuron: int = _RECALL_MAX_RELATED_PER_NEURON,
           max_related_total: int = _RECALL_MAX_RELATED_TOTAL,
-          include_assertions: bool = False) -> Dict:
+           include_assertions: bool = False, ask: Optional[str] = None,
+           ask_strict: bool = False, no_assistant: bool = False,
+           provider: Optional[str] = None) -> Dict:
     """
     Consolidated retrieval for one or more keywords: a single call that finds,
     loads, and shapes the relevant neuron bodies (plus a bounded summary of
@@ -729,13 +731,47 @@ def recall(terms: Union[str, List[str]], depth: int = 1, limit: int = 20,
     if semantic_pending:
         stats["semantic_pending"] = True
 
-    return {
+    result = {
         "query_terms": terms,
         "matched": matched,
         "related": related,
         "stats": stats,
         "truncated": truncated,
     }
+    if ask is not None and not no_assistant:
+        assistant_cfg = _assistant_config()
+        if not assistant_cfg.get("enabled", False):
+            result["assistant"] = None
+            result["assistant_error"] = "disabled"
+        else:
+            wide = result
+            wide_limit = int(assistant_cfg.get("recall_max_full", 40))
+            wide = recall(terms, depth=depth, limit=limit, hybrid=hybrid,
+                          max_full=wide_limit, max_related_per_neuron=max_related_per_neuron,
+                          max_related_total=max_related_total * max(1, wide_limit // max(1, max_full)),
+                          include_assertions=include_assertions)
+            wide_text = json.dumps(wide, ensure_ascii=False, sort_keys=True)
+            if truncated or len(wide_text) >= int(assistant_cfg.get("recall_min_chars", 12000)):
+                rr = _reader.ask(wide_text, ask, config={"assistant": assistant_cfg}, kind="json_output", provider=provider)
+                if rr.error:
+                    result["assistant"] = None
+                    result["assistant_error"] = rr.error
+                    if rr.detail:
+                        print(f"assistant provider failure: {rr.detail}", file=sys.stderr)
+                else:
+                    result["assistant"] = _assistant_result(rr)
+                    persisted = _fold_payload(
+                        wide_text.encode("utf-8"),
+                        {"tool": "recall", "cmd": "recall --ask", "path": None, "cwd": os.getcwd()},
+                        label=f"recall --ask: {ask}", kind="json_output", root=get_root(),
+                        allow_knewrall_source=True,
+                    )
+                    if not persisted.get("passthrough"):
+                        result["assistant_engram_key"] = persisted.get("key")
+            else:
+                result["assistant"] = None
+                result["assistant_error"] = "below_threshold"
+    return result
 
 
 def refresh_index() -> Dict:
@@ -1844,6 +1880,7 @@ def _fold_payload(
     session_id: Optional[str] = None,
     root: Optional[Path] = None,
     quiet: bool = False,
+    allow_knewrall_source: bool = False,
 ) -> Dict[str, Any]:
     """Shared core of `fold()` and `precompact_ingest()`: apply protection
     rules 1-3/6, classify+digest, and write the engram. Pulled out so the
@@ -1858,7 +1895,7 @@ def _fold_payload(
     cfg = _engrams_config()
 
     # Rule 3: never re-fold Knewrall's own output.
-    if _is_knewrall_invocation(source.get("cmd")):
+    if not allow_knewrall_source and _is_knewrall_invocation(source.get("cmd")):
         return {"passthrough": True, "content": payload_bytes.decode("utf-8", errors="replace")}
 
     # Rule 2: instruction-context files ARE the system prompt — refuse.

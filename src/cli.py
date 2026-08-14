@@ -107,6 +107,10 @@ def main():
                                help="Disable semantic vector search; literal match only")
     recall_parser.add_argument("--include-assertions", action="store_true", default=False,
                                help="Include assertion blocks (sources, recorded_at, etc.) in output")
+    recall_parser.add_argument("--ask", default=None, dest="question")
+    recall_parser.add_argument("--provider", default=None)
+    recall_parser.add_argument("--no-assistant", action="store_true")
+    recall_parser.add_argument("--ask-strict", action="store_true")
 
     # ── Code graph commands ───────────────────────────────────────────────────
 
@@ -390,11 +394,17 @@ def main():
                 print(f"{r['id']} | {r['type']} | {r['canonical_name']} | aliases: {r['aliases']}")
     elif args.command == "recall":
         result = recall(args.terms, depth=args.depth, limit=args.limit, hybrid=args.hybrid,
-                        include_assertions=args.include_assertions)
+                        include_assertions=args.include_assertions, ask=args.question,
+                        provider=args.provider, no_assistant=args.no_assistant,
+                        ask_strict=args.ask_strict)
         if args.format == "json":
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             print(encode_toon(result), end="")
+        if args.question is not None and result.get("assistant_error"):
+            print(f"assistant_error: {result['assistant_error']}", file=sys.stderr)
+            if args.ask_strict and result["assistant_error"] != "below_threshold":
+                sys.exit(3)
     elif args.command == "propose-node":
         # Resolve the payload source: --json string, a file path, or stdin ('-'/omitted).
         try:
