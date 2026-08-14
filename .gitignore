@@ -4,6 +4,10 @@
 /.knewrall/index.db
 /.knewrall/index.db-journal
 /.knewrall/index.db-wal
+/.knewrall/reader_probe.json
+/.knewrall/reader_cache.db
+/.knewrall/reader_cache.db-wal
+/.knewrall/reader_cache.db-shm
 /.knewrall/codegraph.db
 /.knewrall/codegraph.db-journal
 /.knewrall/codegraph.db-wal

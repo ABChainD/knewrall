@@ -44,6 +44,7 @@ from .knewrall_middleware import (
     fold_stats,
 )
 from .knewrall_toon import encode as encode_toon
+from .knewrall_reader_router import detect
 
 
 def _parse_duration_hours(text: str) -> float:
@@ -316,6 +317,9 @@ def main():
 
     # fold-stats — per-kind fold/unfold counts, unfold rate, disk usage
     subparsers.add_parser("fold-stats", help="Per-kind fold/unfold counts, unfold rate, adaptive settings, disk usage")
+
+    probe_parser = subparsers.add_parser("reader-probe", help="Show configured ARL provider availability")
+    probe_parser.add_argument("--refresh", action="store_true")
 
     args = parser.parse_args()
 
@@ -688,6 +692,11 @@ def main():
     elif args.command == "fold-stats":
         result = fold_stats()
         print(encode_toon(result), end="")
+
+    elif args.command == "reader-probe":
+        for name, status in detect(refresh=args.refresh).items():
+            suffix = f" ({status.resolved})" if status.resolved else ""
+            print(f"{name}: {'available' if status.available else 'unavailable'} - {status.reason}{suffix}")
 
     else:
         parser.print_help()
