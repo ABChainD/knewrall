@@ -15,6 +15,34 @@ from typing import Any, Dict, List, Optional
 from .paths import get_root
 from . import knewrall_reader_router as router
 
+try:
+    import pypdf
+except ImportError:  # optional Phase 6 dependency
+    pypdf = None
+
+
+def read_file(path: str) -> tuple[str, Optional[str]]:
+    """Read UTF-8 text, or extract a PDF text layer when pypdf is available."""
+    if Path(path).suffix.lower() == ".pdf":
+        if pypdf is None:
+            return "", "pypdf is not installed; pipe extracted PDF text via stdin instead"
+        try:
+            pdf = pypdf.PdfReader(path)
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        except Exception as exc:
+            return "", f"could not read PDF: {exc}"
+        if not text.strip():
+            return "", "no extractable text layer (scanned/image-only PDFs are unsupported)"
+        return text, None
+    try:
+        return Path(path).read_text(encoding="utf-8"), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return "", str(exc)
+
+
+def pdf_status() -> str:
+    return "pypdf: available" if pypdf is not None else "pypdf: absent (PDF callers must pipe extracted text)"
+
 
 @dataclass
 class ReaderResult:

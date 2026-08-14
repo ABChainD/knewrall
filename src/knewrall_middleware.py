@@ -1979,13 +1979,21 @@ def fold(
     root = get_root()
 
     if file is not None:
-        try:
-            with open(file, "rb") as f:
-                payload_bytes = f.read()
-        except OSError as e:
-            result = {"passthrough": True, "content": "", "warning": f"cannot read {file}: {e}", "assistant_error": "not_folded"}
-            return _apply_fold_assistant(result, "", ask=ask, ask_strict=ask_strict,
-                                         no_assistant=no_assistant, provider=provider, root=root)
+        if Path(file).suffix.lower() == ".pdf":
+            text, input_error = _reader.read_file(file)
+            if input_error:
+                result = {"passthrough": True, "content": "", "warning": input_error, "assistant_error": "not_folded"}
+                return _apply_fold_assistant(result, "", ask=ask, ask_strict=ask_strict,
+                                             no_assistant=no_assistant, provider=provider, root=root)
+            payload_bytes = text.encode("utf-8")
+        else:
+            try:
+                with open(file, "rb") as f:
+                    payload_bytes = f.read()
+            except OSError as e:
+                result = {"passthrough": True, "content": "", "warning": f"cannot read {file}: {e}", "assistant_error": "not_folded"}
+                return _apply_fold_assistant(result, "", ask=ask, ask_strict=ask_strict,
+                                             no_assistant=no_assistant, provider=provider, root=root)
         source = {"tool": "Read", "cmd": None, "path": str(Path(file).resolve()), "cwd": os.getcwd()}
     else:
         payload_bytes = (content or "").encode("utf-8")

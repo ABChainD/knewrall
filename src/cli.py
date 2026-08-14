@@ -45,7 +45,7 @@ from .knewrall_middleware import (
 )
 from .knewrall_toon import encode as encode_toon
 from .knewrall_reader_router import detect
-from .knewrall_reader import ask as reader_ask, stats as reader_stats, cache_gc
+from .knewrall_reader import ask as reader_ask, stats as reader_stats, cache_gc, read_file, pdf_status, ReaderResult
 
 
 def _parse_duration_hours(text: str) -> float:
@@ -764,14 +764,15 @@ def main():
         for name, status in detect(refresh=args.refresh).items():
             suffix = f" ({status.resolved})" if status.resolved else ""
             print(f"{name}: {'available' if status.available else 'unavailable'} - {status.reason}{suffix}")
+        print(pdf_status())
 
     elif args.command == "reader-ask":
-        try:
-            text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
-        except OSError as exc:
-            print(f"Error reading input: {exc}", file=sys.stderr)
-            sys.exit(1)
-        result = reader_ask(text, args.question, provider=args.provider, no_assistant=args.no_assistant)
+        if args.file:
+            text, input_error = read_file(args.file)
+        else:
+            text, input_error = sys.stdin.read(), None
+        error_code = "pdf_error" if args.file and Path(args.file).suffix.lower() == ".pdf" else "file_error"
+        result = ReaderResult(error=error_code, detail=input_error) if input_error else reader_ask(text, args.question, provider=args.provider, no_assistant=args.no_assistant)
         print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
         if args.ask_strict and result.error:
             sys.exit(3)
