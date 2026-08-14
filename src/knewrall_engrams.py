@@ -50,7 +50,7 @@ DEFAULT_SESSION_IDLE_HOURS = 8
 DEFAULT_MAX_SESSION_BYTES = 256 * 1024 * 1024  # 256 MB (drops to 128MB once Phase 4 gzip lands)
 KEY_PREFIX_LEN = 10  # hex chars of sha256 used as the initial content-addressed key
 HEADER_SCHEMA_VERSION = 1
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 
 # Paths that mark an engram as durable-already (path-based protection, fixing
 # the plan's originally-unimplementable checksum-based rule 6).
@@ -386,6 +386,8 @@ def rebuild_session_manifest(session: Session, root: Optional[Path] = None) -> D
                 "protected": bool(header.get("protected", False)),
                 "consolidated_to": None,
                 "archived_path": None,
+                "assistant_answers": {},
+                "assistant_keywords": [],
             }
             manifest["engram_count"] += 1
             manifest["bytes_folded"] += header.get("bytes", 0)
@@ -468,6 +470,8 @@ def write_engram(
         "protected": protected,
         "consolidated_to": None,
         "archived_path": None,
+        "assistant_answers": {},
+        "assistant_keywords": [],
     }
     manifest["engram_count"] += 1
     manifest["bytes_folded"] += new_bytes
@@ -596,6 +600,8 @@ def read_meta(key: str, *, session: Optional[Session] = None, root: Optional[Pat
         "ttl_at": state.get("ttl_at"),
         "consolidated_to": state.get("consolidated_to"),
         "archived_path": state.get("archived_path"),
+        "assistant_answers": state.get("assistant_answers", {}),
+        "assistant_keywords": state.get("assistant_keywords", []),
     })
     return merged
 
@@ -679,6 +685,8 @@ def read_engram(
         "ttl_at": state.get("ttl_at"),
         "consolidated_to": state.get("consolidated_to"),
         "archived_path": state.get("archived_path"),
+        "assistant_answers": state.get("assistant_answers", {}),
+        "assistant_keywords": state.get("assistant_keywords", []),
     })
     return {"meta": meta, "content": content, "truncated": truncated}
 
@@ -772,6 +780,8 @@ def list_engrams(
                 "ttl_at": state.get("ttl_at"),
                 "consolidated_to": state.get("consolidated_to"),
                 "archived_path": state.get("archived_path"),
+                "assistant_answers": state.get("assistant_answers", {}),
+                "assistant_keywords": state.get("assistant_keywords", []),
             })
             results.append(merged)
 

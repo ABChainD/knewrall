@@ -10,6 +10,7 @@ AI agents must use this middleware exclusively—no direct file writes.
 import fnmatch
 import json
 import os
+import sys
 import re
 import threading
 import uuid
@@ -30,6 +31,7 @@ from .knewrall_codegraph import KnewrallCodeGraph, DEFAULT_PROJECTS_DIR
 from .knewrall_env import load_dotenv_once
 from . import knewrall_engrams as _engrams
 from . import knewrall_fold_router as _fold_router
+from . import knewrall_reader as _reader
 
 # Make provider API keys (OPENROUTER_API_KEY, etc.) reachable regardless of the
 # invoking harness — the engine talks to the embedding provider on its own.
@@ -1759,6 +1761,23 @@ def _engrams_config() -> Dict[str, Any]:
     return cfg
 
 
+def _assistant_config() -> Dict[str, Any]:
+    try:
+        with open(get_root() / ".knewrall" / "config.json", "r", encoding="utf-8") as fh:
+            return json.load(fh).get("assistant", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _assistant_result(result: Any) -> Dict[str, Any]:
+    return {
+        "answer": result.answer, "keywords": result.keywords, "tags": result.tags,
+        "confidence": result.confidence, "provider": result.provider, "model": result.model,
+        "transport": result.transport, "cached": result.cached, "partial": result.partial,
+        "chunks_used": result.chunks_used, "chunks_total": result.chunks_total,
+    }
+
+
 def _is_never_fold_path(path: Optional[str], globs: List[str], root: Path) -> bool:
     """Rule 2 (instruction-context protection): these files ARE the system
     prompt in this workspace — fold/fold-run must refuse to fold them.
@@ -1945,6 +1964,10 @@ def unfold(
     tail: Optional[int] = None,
     meta_only: bool = False,
     max_chars: Optional[int] = None,
+    ask: Optional[str] = None,
+    ask_strict: bool = False,
+    no_assistant: bool = False,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read a folded payload back, windowed by default (unfold_max_chars) —
     see plan §4.2. `unfold_max_chars` is enforced HERE (not left to the
@@ -1994,6 +2017,34 @@ def unfold(
     header_cmd = (result.get("meta", {}).get("source") or {}).get("cmd")
     _engrams.record_adaptive_unfold(root, header_kind, header_cmd)
     result["found"] = True
+    if ask is not None and not no_assistant:
+        assistant_cfg = _assistant_config()
+        if not assistant_cfg.get("enabled", False):
+            result["assistant"] = None
+            result["assistant_error"] = "disabled"
+        else:
+            full_result = _engrams.read_engram(key, session=session, root=root)
+            if len(full_result["content"]) >= int(assistant_cfg.get("min_chars", 20000)):
+                full_text = full_result["content"]
+                rr = _reader.ask(full_text, ask, config={"assistant": assistant_cfg}, kind=header_kind, provider=provider)
+                if rr.error:
+                    result["assistant"] = None
+                    result["assistant_error"] = rr.error
+                    if rr.detail:
+                        print(f"assistant provider failure: {rr.detail}", file=sys.stderr)
+                else:
+                    result["assistant"] = _assistant_result(rr)
+                    qhash = _reader._question_hash(ask)
+                    meta = result["meta"]
+                    answers = dict(meta.get("assistant_answers") or {})
+                    answers[qhash] = {**result["assistant"], "question": ask, "created_at": _engrams._iso(_engrams._now())}
+                    keywords = list(dict.fromkeys((meta.get("assistant_keywords") or []) + rr.keywords))[:24]
+                    _engrams.update_engram_state(key, session=session, root=root, assistant_answers=answers, assistant_keywords=keywords)
+                    meta["assistant_answers"] = answers
+                    meta["assistant_keywords"] = keywords
+            else:
+                result["assistant"] = None
+                result["assistant_error"] = "below_threshold"
     return result
 
 
@@ -2309,6 +2360,7 @@ def _score_engram(header: Dict[str, Any], terms_lower: List[str]) -> Tuple[float
     I4): at a session's corpus size (tens of engrams), IDF is sampling noise,
     not signal."""
     keywords = [k.lower() for k in header.get("keywords", [])]
+    assistant_keywords = [k.lower() for k in header.get("assistant_keywords", [])]
     label = (header.get("label") or "").lower()
     digest = (header.get("digest") or "").lower()
 
@@ -2318,6 +2370,9 @@ def _score_engram(header: Dict[str, Any], terms_lower: List[str]) -> Tuple[float
         hit = False
         if any(t == kw or t in kw or kw in t for kw in keywords):
             score += 3
+            hit = True
+        if any(t == kw or t in kw or kw in t for kw in assistant_keywords):
+            score += 2
             hit = True
         if t in label:
             score += 2
@@ -2474,7 +2529,7 @@ def _suggest_node_payload(meta: Dict[str, Any]) -> Dict[str, Any]:
     digest = meta.get("digest", "")
     keywords = meta.get("keywords") or []
     pillar = _KIND_TO_PILLAR_HINT.get(kind, "What")
-    return {
+    payload = {
         "header": {"type": pillar, "canonical_name": label, "aliases": []},
         "descriptions": {"conceptual": digest},
         "properties": {
@@ -2483,6 +2538,12 @@ def _suggest_node_payload(meta: Dict[str, Any]) -> Dict[str, Any]:
         },
         "tags": [kind, "from-engram"],
     }
+    if meta.get("assistant_answers"):
+        payload["properties"]["assistant_claim"] = [{"value": "machine-derived", "certainty": "hypothetical"}]
+        payload["properties"]["assistant_claim"][0]["assertion"] = {
+            "sources": [f"text:assistant:{answer.get('provider', 'unknown')}/{answer.get('model', 'unknown')}:{meta.get('key', '')}"]
+        }
+    return payload
 
 
 def consolidate_engram(
@@ -2682,6 +2743,7 @@ def fold_stats(*, root: Optional[Path] = None) -> Dict[str, Any]:
     stats: Dict[str, Any] = {
         "sessions": 0, "engrams": 0, "bytes_folded": 0, "unfold_count": 0,
         "consolidated": 0, "protected": 0, "by_kind": {}, "adaptive": {},
+        "assistant": {"engrams": 0, "answers": 0, "questions": 0, "providers": [], "models": []},
     }
     if not eroot.is_dir():
         return stats
@@ -2706,6 +2768,15 @@ def fold_stats(*, root: Optional[Path] = None) -> Dict[str, Any]:
                 stats["consolidated"] += 1
             if state.get("protected"):
                 stats["protected"] += 1
+            answers = state.get("assistant_answers") or {}
+            stats["assistant"]["engrams"] += bool(answers)
+            stats["assistant"]["answers"] += len(answers)
+            stats["assistant"]["questions"] += len(answers)
+            for answer in answers.values():
+                if answer.get("provider"):
+                    stats["assistant"]["providers"].append(answer["provider"])
+                if answer.get("model"):
+                    stats["assistant"]["models"].append(answer["model"])
             kind = header.get("kind", "prose")
             bucket = stats["by_kind"].setdefault(kind, {"folds": 0, "unfolds": 0})
             bucket["folds"] += 1
@@ -2717,5 +2788,8 @@ def fold_stats(*, root: Optional[Path] = None) -> Dict[str, Any]:
     adaptive = _engrams._read_json(_engrams._adaptive_stats_path(root))
     if adaptive:
         stats["adaptive"] = adaptive
+
+    stats["assistant"]["providers"] = sorted(set(stats["assistant"]["providers"]))
+    stats["assistant"]["models"] = sorted(set(stats["assistant"]["models"]))
 
     return stats

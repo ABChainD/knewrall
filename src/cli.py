@@ -270,6 +270,10 @@ def main():
     unfold_parser.add_argument("--max-chars", type=int, default=None, dest="max_chars")
     unfold_parser.add_argument("--meta", action="store_true", dest="meta_only", help="Header only (TOON)")
     unfold_parser.add_argument("--session", dest="session_id", default=None, help="Explicit session id override")
+    unfold_parser.add_argument("--ask", default=None, dest="question")
+    unfold_parser.add_argument("--provider", default=None)
+    unfold_parser.add_argument("--no-assistant", action="store_true")
+    unfold_parser.add_argument("--ask-strict", action="store_true")
 
     # folds — list this session's engrams
     folds_parser = subparsers.add_parser("folds", help="List this session's engrams (metadata only, TOON)")
@@ -621,7 +625,9 @@ def main():
         result = unfold(args.key, session_id=args.session_id, grep=args.grep,
                         grep_context=args.grep_context, lines=lines_tuple,
                         head=args.head, tail=args.tail, meta_only=args.meta_only,
-                        max_chars=args.max_chars)
+                        max_chars=args.max_chars, ask=args.question,
+                        provider=args.provider, no_assistant=args.no_assistant,
+                        ask_strict=args.ask_strict)
         if not result["found"]:
             print(result["error"], file=sys.stderr)
             sys.exit(1)
@@ -631,6 +637,13 @@ def main():
             print(result["content"])
             if result.get("truncated"):
                 print("[truncated: use --lines or --grep to target]", file=sys.stderr)
+            if args.question is not None:
+                if result.get("assistant"):
+                    print(json.dumps({"assistant": result["assistant"]}, ensure_ascii=False, indent=2))
+                elif result.get("assistant_error"):
+                    print(f"assistant_error: {result['assistant_error']}", file=sys.stderr)
+                    if args.ask_strict and result.get("assistant_error") != "below_threshold":
+                        sys.exit(3)
 
     elif args.command == "folds":
         result = list_folds(session_id=args.session_id, kind=args.kind, grep=args.grep,
