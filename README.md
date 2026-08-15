@@ -81,7 +81,7 @@ durable facts — no special prompt required each time.
 | 🔎 **Semantic + literal search** | Hybrid retrieval blends exact-match search with vector KNN over embeddings, merged via Reciprocal Rank Fusion, so a query matches on *meaning* as well as substring. |
 | 🪐 **3D Graph Viewer** | A local, self-contained explorer — fly through your graph, hover, expand, follow links, search — all in the browser, all offline. |
 | 🧵 **Short-term memory** | `fold-run` captures verbose command output (test runs, builds, logs) to disk and hands your agent a short digest instead of the raw dump — retrievable on demand, auto-expiring, promotable to a durable Neuron if it turns out to matter. |
-| 🤖 **Assistant Reader Layer** *(opt-in, disabled by default)* | Ask a specific question against text your agent is already holding — `--ask "..."` on `recall`/`unfold`/`fold`/`fold-run`, or standalone via `reader-ask`. Query-conditioned, not a fixed digest; deterministic output is always returned unchanged alongside the answer. See [`docs/ASSISTANT_READER_LAYER.md`](docs/ASSISTANT_READER_LAYER.md). |
+| 🤖 **Assistant Reader Layer** | Ask a specific question against text your agent is already holding — `--ask "..."` on `recall`/`unfold`/`fold`/`fold-run`, or standalone via `reader-ask`. Query-conditioned, not a fixed digest; deterministic output is always returned unchanged alongside the answer. Enabled by default, auto-picks whichever configured model actually resolves on your machine (Claude Code's Haiku, OpenCode, OpenRouter, or Ollama). See [`docs/ASSISTANT_READER_LAYER.md`](docs/ASSISTANT_READER_LAYER.md). |
 | 🔌 **Any agent harness** | One installer wires Claude Code, Codex, Gemini CLI, Cline, and anything else that reads a root instruction file. |
 | 🔒 **Local-first & private** | Plain files on your disk. No account, no cloud dependency, no lock-in. Semantic search calls out only when *you* enable it. |
 
@@ -239,8 +239,8 @@ default — layered on top of the same CLI you already use: `fold`, `fold-run`,
 
 Folding gives you a fixed digest, computed before anyone knows what will be asked
 about it. When you need an actual answer to a specific question instead, the
-opt-in **Assistant Reader Layer** adds `--ask "<question>"` to `fold`/`fold-run`/
-`unfold`/`recall`, query-conditioned rather than fixed. See
+**Assistant Reader Layer** adds `--ask "<question>"` to `fold`/`fold-run`/
+`unfold`/`recall`, query-conditioned rather than fixed — enabled by default. See
 [`docs/ASSISTANT_READER_LAYER.md`](docs/ASSISTANT_READER_LAYER.md).
 
 ## Directory Structure

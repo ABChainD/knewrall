@@ -52,8 +52,9 @@ live-reload dev loop); skip them if you just want to use the tool.
 ## Setup (one-time, needs network for the package installs)
 
 The backend gets its **own virtual environment** (`knewrall/viewer/.venv`),
-kept separate from whatever Python environment the rest of Knewrall/Teamwork
-use. Installing FastAPI/uvicorn into a shared global environment can drag in
+kept separate from whatever Python environment the rest of Knewrall (or
+anything else in the host workspace) uses. Installing FastAPI/uvicorn into a
+shared global environment can drag in
 an incompatible `starlette`/`uvicorn` pin and break other tools that depend on
 a newer one (e.g. anything using `sse-starlette`, like the MCP server) — the
 venv avoids that entirely.

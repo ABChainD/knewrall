@@ -96,9 +96,9 @@
     "embed_code_symbols": true
   },
   "assistant": {
-    "enabled": false,
-    "provider": "opencode",
-    "fallback_order": ["opencode"],
+    "enabled": true,
+    "provider": "claude",
+    "fallback_order": ["claude", "opencode", "openrouter", "ollama"],
     "detect_cache_seconds": 3600,
     "min_chars": 20000,
     "recall_min_chars": 12000,
@@ -111,6 +111,15 @@
     "cache_db_path": ".knewrall/reader_cache.db",
     "cache_ttl_hours": 720,
     "providers": {
+      "claude": {
+        "transport": "cli",
+        "binary": "claude",
+        "args": ["-p", "--model", "{model}", "--output-format", "text", "--allowedTools", ""],
+        "prompt_via": "stdin",
+        "model": "claude-haiku-4-5-20251001",
+        "timeout_seconds": 60,
+        "max_prompt_chars": 200000
+      },
       "opencode": {
         "transport": "cli",
         "binary": "opencode",

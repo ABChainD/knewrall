@@ -2,11 +2,12 @@
 """
 Knewrall UserPromptSubmit hook — per-turn fold-scan (Engram Layer Phase 3a).
 
-Fires once per user turn. Registered in the SAME `UserPromptSubmit` hook
-group as `teamwork_route.py` (install.py appends to the group rather than
-replacing it — see install_claude_hardening()); this hook runs AFTER
-teamwork's router, deliberately, not incidentally (documented here so a
-future change doesn't reorder it without noticing).
+Fires once per user turn. Registered in the `UserPromptSubmit` hook group
+alongside any other hook the host workspace may already have there
+(install.py appends to the group rather than replacing it — see
+install_claude_hardening()); this hook is meant to run AFTER whatever else is
+already registered there, deliberately, not incidentally (documented here so
+a future change doesn't reorder it without noticing).
 
 Reads the prompt from the hook payload on stdin, extracts a handful of
 identifier-shaped terms, runs `fold-scan` against the current session's
@@ -22,10 +23,11 @@ _refresh_index_best_effort(). A hook failure must never block a turn.
 Honest latency note (Kimi K3 critique I10): fold-scan's own internal
 _FOLD_SCAN_DEADLINE (1.5s) is measured AFTER this hook's own Python
 interpreter has already started and after knewrall_middleware's imports have
-already run — cold interpreter start is ~0.4-1.0s on its own, and this hook
-fires after teamwork_route.py already spent its own time in the same group.
-Observed wall-clock per prompt is therefore closer to ~2.5s worst case, not
-a tight 1.5s — that is the number to plan around, not the deadline constant
+already run — cold interpreter start is ~0.4-1.0s on its own, and if another
+hook is registered earlier in the same group, this hook fires after that
+hook has already spent its own time. Observed wall-clock per prompt can
+therefore run closer to ~2.5s worst case in a multi-hook workspace, not a
+tight 1.5s — that is the number to plan around, not the deadline constant
 alone.
 """
 

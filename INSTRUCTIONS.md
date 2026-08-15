@@ -147,9 +147,10 @@ from entering it in the first place, which is strictly better anyway.
 Engrams live in `knewrall/engrams/`, are never indexed (invisible to
 `refresh-index`/`rebuild-index` by construction), never synced across machines, and
 TTL out automatically (default 72h). Nothing here is durable — promote anything
-worth keeping into a Neuron. **Never put a bare engram key in a `remote add --task`
-string** (teamwork's remote-dispatch verb) — the receiving machine can't resolve it;
-`consolidate` the content into a Neuron first if it needs to cross machines.
+worth keeping into a Neuron. **Never put a bare engram key in a prompt or task
+string handed off to a different machine or process** — the receiving side can't
+resolve it; `consolidate` the content into a Neuron first if it needs to cross
+machines.
 
 ---
 

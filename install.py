@@ -161,9 +161,10 @@ def install_claude_hardening(workspace: Path, *, with_fold_enforcement: bool = F
         changed = True
 
     # APPEND to the existing UserPromptSubmit group — never replace it. Other
-    # subsystems (e.g. teamwork's teamwork_route.py) may already own a hook
-    # there, and this one is meant to run AFTER it (fold-scan re-surfacing
-    # folded context is lower priority than routing the turn itself).
+    # tools in the host workspace may already own a hook there, and this one
+    # is meant to run AFTER whatever else is registered (fold-scan
+    # re-surfacing folded context is lower priority than routing the turn
+    # itself).
     prompt_hooks = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
     already_prompt = any(
         h.get("command") == FOLD_TURN_HOOK_COMMAND
@@ -268,6 +269,62 @@ def build_index() -> None:
     rebuild_index_command(True)
 
 
+def report_assistant_status() -> None:
+    """Assistant Reader Layer ships `enabled: true` by default. This just
+    tells the user which configured provider will actually be used on THIS
+    machine (`claude`/Haiku, `opencode`/DeepSeek, or an already-configured
+    `openrouter`/`ollama` fallback — whichever resolves first), or, if none
+    of them resolve, explains why and offers to disable it rather than
+    leaving `--ask` silently failing loud on every call. Never overwrites an
+    already-customized config beyond that one opt-out — idempotent like the
+    rest of this installer, and a no-op if the user already disabled it."""
+    config_path = KNEWRALL_DIR / ".knewrall" / "config.json"
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    assistant = data.get("assistant", {})
+    if not assistant.get("enabled", False):
+        return
+
+    os.environ["KNEWRALL_ROOT"] = str(KNEWRALL_DIR)
+    sys.path.insert(0, str(KNEWRALL_DIR))
+    from src import knewrall_reader_router as router
+
+    statuses = router.detect({"assistant": assistant}, refresh=True)
+    order = [assistant["provider"]] if assistant.get("provider") else []
+    order += [name for name in assistant.get("fallback_order", []) if name not in order]
+    available = [name for name in order if statuses.get(name) and statuses[name].available]
+
+    print("Assistant Reader Layer (--ask on recall/unfold/fold/fold-run):")
+    if available:
+        print(f"  Enabled, using '{available[0]}'. Change assistant.provider in "
+              ".knewrall/config.json anytime, or set assistant.enabled=false to disable.")
+        return
+
+    print(f"  Enabled in config, but none of the configured providers "
+          f"({', '.join(order) or 'none configured'}) resolved on this machine — "
+          "--ask calls will fail loud rather than silently succeed.")
+    for name in order:
+        status = statuses.get(name)
+        if status:
+            print(f"    - {name}: {status.reason}")
+    print("  Install one of the above (e.g. the Claude Code or OpenCode CLI), set an "
+          "OPENROUTER_API_KEY, or run a local Ollama server — or edit assistant.providers "
+          "in .knewrall/config.json to point at whatever you do have.")
+
+    if not sys.stdin.isatty():
+        return
+    try:
+        choice = input("  Disable the Assistant Reader Layer for now instead? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        choice = ""
+    if choice == "y":
+        data.setdefault("assistant", {})["enabled"] = False
+        config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        print("  assistant.enabled set to false. Flip it back to true once a provider is available.")
+
+
 def relpath(target: Path, start: Path) -> str:
     return Path(os.path.relpath(target, start)).as_posix()
 
@@ -317,6 +374,8 @@ def main() -> None:
     if not args.no_index:
         print("Building search index...")
         build_index()
+
+    report_assistant_status()
 
     print("\nDone. Agents in this workspace will now ground from and write to the "
           "Knewrall knowledge base automatically.")

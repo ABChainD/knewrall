@@ -1,9 +1,11 @@
 # Assistant Reader Layer (ARL)
 
-Query-conditioned answering over text your agent is already holding. Opt-in,
-disabled by default. See [What it is](../README.md#what-it-is) in the README for
-where this fits in Knewrall's broader job as an agent context management layer —
-this doc is the deep dive on the mechanism itself.
+Query-conditioned answering over text your agent is already holding. Enabled by
+default — it auto-selects whichever configured model actually resolves on your
+machine and never spends a call you didn't ask for. See
+[What it is](../README.md#what-it-is) in the README for where this fits in
+Knewrall's broader job as an agent context management layer — this doc is the
+deep dive on the mechanism itself.
 
 ## What it does
 
@@ -122,14 +124,17 @@ degrading silently if no provider resolves).
 
 ## Hard constraints
 
-- **Zero Teamwork coupling.** Nothing under `knewrall/src/` may import, read,
-  shell out to, or require anything under `teamwork/` — the mirror image of
-  Teamwork's own "zero Knewrall imports in the critical path" guarantee. A fresh
-  clone of this repo alone, with no surrounding workspace, yields a working ARL;
-  everything environment-specific lives in `.knewrall/config.json`, never in code.
-- **Disabled by default.** `assistant.enabled` ships `false`. Producing the
-  feature and activating it are deliberately separate acts — flipping the flag
-  is a manual, explicit step for whoever installs Knewrall, never automatic.
+- **Zero coupling to anything outside this repo.** Nothing under `knewrall/src/`
+  may import, read, shell out to, or require any other tool or path that merely
+  happens to live alongside Knewrall in a given workspace. A fresh clone of this
+  repo alone, with no surrounding workspace, yields a working ARL; everything
+  environment-specific lives in `.knewrall/config.json`, never in code.
+- **Enabled by default, but never fires unprompted.** `assistant.enabled` ships
+  `true`, and the shipped `fallback_order` auto-selects whichever configured
+  provider actually resolves on your machine — but the mechanism only ever
+  activates on an explicit `--ask "<question>"`. No call is ever made on your
+  behalf without one, so "enabled" costs nothing until you actually ask it
+  something. Set `assistant.enabled: false` to turn the whole layer off.
 - **Additive, never a substitute.** The deterministic output of `unfold`/
   `recall`/`fold`/`fold-run` is always returned unchanged; the assistant's answer
   is a separate, clearly attributed field alongside it.
@@ -140,8 +145,8 @@ All keys live under `assistant` in `.knewrall/config.json`:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Master switch. Everything else is inert while this is `false`. |
-| `provider` / `fallback_order` | `"opencode"` / `["opencode"]` | Default provider and fallback chain. |
+| `enabled` | `true` | Master switch. Set `false` to turn the whole layer off; everything else is inert while it is. |
+| `provider` / `fallback_order` | `"claude"` / `["claude", "opencode", "openrouter", "ollama"]` | Preferred provider, then a fallback chain tried in order until one actually resolves on this machine (`resolve()` picks the first available; see [Design](#design)). Ships with a cheap model per provider: Claude Code's Haiku, OpenCode's DeepSeek V4 Flash, and whatever you've configured for OpenRouter/Ollama. |
 | `providers.<name>` | — | Per-provider transport config (`cli` or `http`), model, timeouts, and (for `http`) `key_env` — an ordered list of environment variables checked for an API key. |
 | `detect_cache_seconds` | `3600` | How long a provider-availability probe is trusted before re-checking. |
 | `min_chars` / `hint_on_threshold` | `20000` / `true` | Passive `--ask` hint threshold on fold/unfold results. |
@@ -160,9 +165,15 @@ of which model is configured.
 
 Implemented 2026-08-14: harness router, standalone reader + cache, `unfold`/
 `recall` integration, `fold`/`fold-run` integration, and optional PDF extraction
-are all in place and covered by the test suite. Background enrichment (a
-previously-considered phase that would run ARL unprompted) was **deliberately
-deferred** — the same "no silent background spend" reasoning that keeps
-`enabled: false` by default applies doubly to anything that would call a model
-without an explicit ask. `assistant.enabled` remains `false`; turning it on is a
-separate, manual decision for whoever runs this install.
+are all in place and covered by the test suite. Ships `assistant.enabled: true`,
+with `install.py` reporting which configured provider actually resolved on your
+machine (or, if none did, explaining why and offering to disable it rather than
+leaving every `--ask` call failing loud).
+
+Background enrichment (a previously-considered phase that would run ARL
+*unprompted*, without an explicit `--ask`) was **deliberately deferred** — that's
+a different question from whether the layer itself ships on. The "no silent
+background spend" principle is about never calling a model the caller didn't
+ask for, which `enabled: true` doesn't change: nothing here fires without an
+explicit `--ask` either way. Set `assistant.enabled: false` to opt back out of
+the whole layer at any time.

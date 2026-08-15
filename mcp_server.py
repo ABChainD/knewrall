@@ -149,7 +149,7 @@ def knewrall_unfold(
         JSON: {"content": str, "truncated": bool, "meta": {...}} on success,
         or {"error": str} if the key doesn't resolve (expired, discarded, or
         never existed on this machine — engrams are per-machine and never
-        synced across a `teamwork remote dispatch`).
+        synced to a different machine or remote task).
     """
     lines_tuple = None
     if lines:
