@@ -5,6 +5,7 @@
 <h1 align="center">Knewrall</h1>
 <p align="center"><strong><em>Think, Connect, Understand, Remember. All of it!</em></strong></p>
 <p align="center">Persistent, ownable memory &amp; a knowledge graph for your AI agents.</p>
+<p align="center">Also: an <strong>agent context management layer</strong> — keeping what reaches the model rich, relevant, compact, and efficient.</p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
@@ -13,6 +14,16 @@
 </p>
 
 ## What it is
+
+Call it a knowledge graph if you want, but that undersells the actual job: Knewrall is
+an **agent context management layer** — the thing standing between everything an agent
+could know and the limited, expensive context window it actually reasons in. Every
+piece below serves that one job. Durable facts are captured once and pulled back only
+when relevant, so they don't get re-explained from scratch every session — that's
+**rich**, and **relevant**. Verbose, disposable output (test runs, logs, diffs) gets
+compacted into a short digest instead of flooding the window raw, with the full detail
+kept on disk, not lost — that's **compact**, and **efficient**: fewer tokens spent per
+turn, more of the model's attention left for the actual task.
 
 Knewrall is a **local-first, file-backed knowledge graph** that gives your AI agents a
 durable, shared memory. It turns messy, unstructured input into a clean graph of
@@ -70,6 +81,7 @@ durable facts — no special prompt required each time.
 | 🔎 **Semantic + literal search** | Hybrid retrieval blends exact-match search with vector KNN over embeddings, merged via Reciprocal Rank Fusion, so a query matches on *meaning* as well as substring. |
 | 🪐 **3D Graph Viewer** | A local, self-contained explorer — fly through your graph, hover, expand, follow links, search — all in the browser, all offline. |
 | 🧵 **Short-term memory** | `fold-run` captures verbose command output (test runs, builds, logs) to disk and hands your agent a short digest instead of the raw dump — retrievable on demand, auto-expiring, promotable to a durable Neuron if it turns out to matter. |
+| 🤖 **Assistant Reader Layer** *(opt-in, disabled by default)* | Ask a specific question against text your agent is already holding — `--ask "..."` on `recall`/`unfold`/`fold`/`fold-run`, or standalone via `reader-ask`. Query-conditioned, not a fixed digest; deterministic output is always returned unchanged alongside the answer. See [`docs/ASSISTANT_READER_LAYER.md`](docs/ASSISTANT_READER_LAYER.md). |
 | 🔌 **Any agent harness** | One installer wires Claude Code, Codex, Gemini CLI, Cline, and anything else that reads a root instruction file. |
 | 🔒 **Local-first & private** | Plain files on your disk. No account, no cloud dependency, no lock-in. Semantic search calls out only when *you* enable it. |
 
@@ -225,6 +237,12 @@ default — layered on top of the same CLI you already use: `fold`, `fold-run`,
 `unfold`, `folds`, `fold-scan`, `consolidate`, `fold-gc`. Full command reference in
 [`INSTRUCTIONS.md`](INSTRUCTIONS.md#2-the-cli-your-only-tools).
 
+Folding gives you a fixed digest, computed before anyone knows what will be asked
+about it. When you need an actual answer to a specific question instead, the
+opt-in **Assistant Reader Layer** adds `--ask "<question>"` to `fold`/`fold-run`/
+`unfold`/`recall`, query-conditioned rather than fixed. See
+[`docs/ASSISTANT_READER_LAYER.md`](docs/ASSISTANT_READER_LAYER.md).
+
 ## Directory Structure
 
 | Folder | Owner | Purpose |
@@ -326,6 +344,7 @@ before acting, and **save** durable new facts as Neurons.
 ## Documentation
 
 - [`INSTRUCTIONS.md`](INSTRUCTIONS.md) — canonical agent operating instructions and full CLI reference.
+- [`docs/ASSISTANT_READER_LAYER.md`](docs/ASSISTANT_READER_LAYER.md) — query-conditioned `--ask` answering over `unfold`/`recall`/`fold`/`fold-run`: design, fail-loud contract, config reference.
 - [`docs/VECTOR_SEARCH.md`](docs/VECTOR_SEARCH.md) — hybrid semantic + literal retrieval design.
 - [`docs/PERF_FINDINGS.md`](docs/PERF_FINDINGS.md) — the embedding-latency investigation that shaped it.
 - [`docs/EMBEDDING_MODEL_BENCHMARK.md`](docs/EMBEDDING_MODEL_BENCHMARK.md) — the 10-model benchmark behind the default embedding model.
